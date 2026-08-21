@@ -37,10 +37,10 @@ type switchableRouteConn struct {
 	failing atomic.Bool
 }
 
-func TestQUICUsesVersion2Only(t *testing.T) {
+func TestQUICPrefersVersion2WithVersion1Fallback(t *testing.T) {
 	versions := quicConfig(flowWindows{}).Versions
-	if len(versions) != 1 || versions[0] != quic.Version2 {
-		t.Fatalf("QUIC versions = %v, want [%v]", versions, quic.Version2)
+	if len(versions) != 2 || versions[0] != quic.Version2 || versions[1] != quic.Version1 {
+		t.Fatalf("QUIC versions = %v, want [%v %v]", versions, quic.Version2, quic.Version1)
 	}
 }
 
