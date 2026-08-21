@@ -515,9 +515,10 @@ func (w flowWindows) validate() error {
 func quicConfig(windows flowWindows) *quic.Config {
 	streamWindow, connectionWindow, streamMax, connectionMax, incomingStreams := windows.resolved()
 	return &quic.Config{
-		// Prefer the standardized QUIC v2 wire image. Pinning both peers avoids
-		// v1-only middleboxes that interfere with the v1 Initial packet format.
-		Versions: []quic.Version{quic.Version2},
+		// Prefer the standardized QUIC v2 wire image for the first Initial while
+		// retaining v1 as a compatibility fallback for peers that do not support
+		// v2. Servers accept both versions; clients try them in this order.
+		Versions: []quic.Version{quic.Version2, quic.Version1},
 		// The handshake gets as long as an erasing path needs.
 		//
 		// On the channel this targets the handshake itself takes about five
