@@ -1,13 +1,16 @@
 package pep
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -26,6 +29,10 @@ func TestClientRejectsUnserviceableConfiguration(t *testing.T) {
 		},
 		"reserve above budget": func(c *ClientConfig) {
 			c.AggregateBytesPerSec = 1
+			c.InteractiveReserveBytesPerSec = 2
+		},
+		"reserve consumes whole budget": func(c *ClientConfig) {
+			c.AggregateBytesPerSec = 2
 			c.InteractiveReserveBytesPerSec = 2
 		},
 		"idle exceeds lifetime": func(c *ClientConfig) {
@@ -70,6 +77,126 @@ func TestClientAdmissionDefaultsAndPendingOpenBound(t *testing.T) {
 	client.releasePendingOpen()
 	if !client.admitPendingOpen() {
 		t.Fatal("released pending-open capacity was not reusable")
+	}
+}
+
+func TestClientSessionLimitCanBeShared(t *testing.T) {
+	_, credentials := testCertificate(t)
+	limit, err := NewSessionLimit(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clients := make([]*Client, 2)
+	for i := range clients {
+		clients[i], err = NewClient(ClientConfig{
+			ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1",
+			Credentials: credentials, SessionLimit: limit,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	slot, admitted := clients[0].sessionLimit.acquire()
+	if !admitted {
+		t.Fatal("first client was not admitted")
+	}
+	if _, admitted := clients[1].sessionLimit.acquire(); admitted {
+		t.Fatal("second client exceeded the shared session limit")
+	}
+	slot.release()
+	sibling, admitted := clients[1].sessionLimit.acquire()
+	if !admitted {
+		t.Fatal("released shared session slot was not reusable")
+	}
+	sibling.release()
+}
+
+func TestSharedSessionLimitsReserveCapacityPerClient(t *testing.T) {
+	limits, err := NewSharedSessionLimits(8, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits[0].Reserved() != 2 || limits[1].Reserved() != 2 {
+		t.Fatalf("reservations = %d and %d, want 2 each", limits[0].Reserved(), limits[1].Reserved())
+	}
+	// The first client drains its own reservation and then the common pool.
+	var held []sessionSlot
+	for range 6 {
+		slot, admitted := limits[0].acquire()
+		if !admitted {
+			t.Fatalf("greedy client was capped at %d sessions, want its reservation plus the common pool", len(held))
+		}
+		held = append(held, slot)
+	}
+	if _, admitted := limits[0].acquire(); admitted {
+		t.Fatal("greedy client exceeded the combined limit")
+	}
+	// Its sibling still has its own reservation, which is the whole point: a
+	// failover target which cannot accept a session is not a failover target.
+	for i := range 2 {
+		if _, admitted := limits[1].acquire(); !admitted {
+			t.Fatalf("reserved slot %d was consumed by the busy sibling", i+1)
+		}
+	}
+	if _, admitted := limits[1].acquire(); admitted {
+		t.Fatal("sibling exceeded its reservation while the common pool was empty")
+	}
+	for _, slot := range held {
+		slot.release()
+	}
+}
+
+func TestSharedSessionLimitsStayCommonWhenTooSmallToReserve(t *testing.T) {
+	limits, err := NewSharedSessionLimits(3, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, limit := range limits {
+		if limit.Reserved() != 0 {
+			t.Fatalf("client %d reserved %d slots from a budget too small to divide", i, limit.Reserved())
+		}
+	}
+	admitted := 0
+	for _, limit := range limits {
+		if _, ok := limit.acquire(); ok {
+			admitted++
+		}
+	}
+	if admitted != 3 {
+		t.Fatalf("admitted %d sessions, want the whole common budget of 3", admitted)
+	}
+}
+
+func TestNewClientRejectsUninitializedSharedSessionLimit(t *testing.T) {
+	_, credentials := testCertificate(t)
+	_, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1",
+		Credentials: credentials, SessionLimit: &SessionLimit{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not initialized") {
+		t.Fatalf("uninitialized shared session limit was accepted: %v", err)
+	}
+}
+
+func TestClientsCanShareOneAggregateBudget(t *testing.T) {
+	_, credentials := testCertificate(t)
+	budget := NewAggregateBudget(1<<20, 0)
+	if budget == nil {
+		t.Fatal("aggregate budget was not built")
+	}
+	clients := make([]*Client, 2)
+	for i := range clients {
+		client, err := NewClient(ClientConfig{
+			ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1",
+			Credentials: credentials, AggregateBytesPerSec: 1 << 20, Budget: budget,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients[i] = client
+	}
+	if clients[0].budget != budget || clients[1].budget != budget {
+		t.Fatal("clients did not share the supplied aggregate budget")
 	}
 }
 
@@ -166,6 +293,10 @@ func TestServerRejectsUnserviceableConfiguration(t *testing.T) {
 			c.AggregateBytesPerSec = 1
 			c.InteractiveReserveBytesPerSec = 2
 		},
+		"reserve consumes whole budget": func(c *ServerConfig) {
+			c.AggregateBytesPerSec = 2
+			c.InteractiveReserveBytesPerSec = 2
+		},
 		"idle exceeds lifetime": func(c *ServerConfig) {
 			c.FlowIdleTimeout = 2 * time.Second
 			c.FlowMaxLifetime = time.Second
@@ -243,5 +374,111 @@ func TestServerQUICStreamCapacitySupportsMobileSessions(t *testing.T) {
 	config := quicServerConfig(flowWindows{})
 	if config.MaxIncomingStreams < 1024 {
 		t.Fatalf("server QUIC stream capacity = %d, want at least 1024", config.MaxIncomingStreams)
+	}
+}
+
+// A chunk larger than the aggregate budget's burst can never be admitted: the
+// budget refuses it outright rather than pacing it, the DATA frame carrying it
+// fails to enqueue, and the lane that was carrying it is failed and retired.
+// The configured chunk size is corrected to what the budget can carry so that
+// an operator's rate limit slows the endpoint down instead of taking its lanes
+// apart.
+func TestChunkSizeIsCappedByAggregateBurst(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	// 128 KiB chunks against 64 KiB/s: a quarter-second burst is well under
+	// the 64 KiB floor, so the floor is the ceiling and every chunk as
+	// configured would have been refused.
+	const rate = 64 * 1024
+	newEndpoints := func(t *testing.T, aggregate uint64) (int, *limiter.Budget, int, *limiter.Budget) {
+		t.Helper()
+		client, err := NewClient(ClientConfig{
+			ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: clientCredentials,
+			ChunkSize: protocol.MaxPayload, AggregateBytesPerSec: aggregate,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, err := NewServer(ServerConfig{
+			ListenAddr: "127.0.0.1:0", Credentials: serverCredentials,
+			ChunkSize: protocol.MaxPayload, AggregateBytesPerSec: aggregate,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client.cfg.ChunkSize, client.budget, server.cfg.ChunkSize, server.budget
+	}
+
+	clientChunk, clientBudget, serverChunk, serverBudget := newEndpoints(t, rate)
+	for name, endpoint := range map[string]struct {
+		chunkSize int
+		budget    *limiter.Budget
+	}{
+		"client": {clientChunk, clientBudget},
+		"server": {serverChunk, serverBudget},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if endpoint.chunkSize >= protocol.MaxPayload {
+				t.Fatalf("chunk size %d was not capped by the aggregate burst", endpoint.chunkSize)
+			}
+			// A cap, not a collapse: a budget that admits bulk at all admits a
+			// whole 64 KiB frame of it, so the correction never leaves the
+			// endpoint sending uselessly small chunks.
+			if endpoint.chunkSize < 64*1024 {
+				t.Fatalf("chunk size %d narrowed below the burst floor", endpoint.chunkSize)
+			}
+			if err := endpoint.budget.Wait(context.Background(), endpoint.chunkSize, false); err != nil {
+				t.Fatalf("a full chunk was not admitted by its own budget: %v", err)
+			}
+		})
+	}
+
+	// Without a budget there is nothing to fit inside, and the chunk size the
+	// operator asked for is the one they get.
+	unpacedClient, _, unpacedServer, _ := newEndpoints(t, 0)
+	if unpacedClient != protocol.MaxPayload || unpacedServer != protocol.MaxPayload {
+		t.Fatalf("unpaced chunk sizes = %d/%d, want %d", unpacedClient, unpacedServer, protocol.MaxPayload)
+	}
+}
+
+func TestSharedBudgetCapsChunkSizeForEveryClient(t *testing.T) {
+	_, credentials := testCertificate(t)
+	// Small enough that the burst floor, not the configured chunk, decides.
+	const aggregate = 100 << 10
+	budget := NewAggregateBudget(aggregate, 0)
+	shared := make([]*Client, 2)
+	for i := range shared {
+		client, err := NewClient(ClientConfig{
+			ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+			ChunkSize: protocol.MaxPayload, AggregateBytesPerSec: aggregate, Budget: budget,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		shared[i] = client
+	}
+	// The cap has to come from the budget the flows will really admit against.
+	// Measuring it against a budget each client built for itself would let a
+	// shared budget admit chunks it then refuses outright, retiring lanes.
+	solo, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+		ChunkSize: protocol.MaxPayload, AggregateBytesPerSec: aggregate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := solo.cfg.ChunkSize
+	if want >= protocol.MaxPayload {
+		t.Fatalf("aggregate %d did not cap the chunk size, so this test proves nothing", aggregate)
+	}
+	for i, client := range shared {
+		if client.budget != budget {
+			t.Fatalf("client %d did not use the shared budget", i)
+		}
+		if client.cfg.ChunkSize != want {
+			t.Fatalf("client %d chunk size = %d, want %d from the shared budget", i, client.cfg.ChunkSize, want)
+		}
+		if client.cfg.ChunkSize > budget.MaxRequest(false) {
+			t.Fatalf("client %d chunk size %d exceeds what the shared budget admits", i, client.cfg.ChunkSize)
+		}
 	}
 }
