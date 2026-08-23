@@ -77,12 +77,21 @@ type Server struct {
 	sessionsMu       sync.RWMutex
 	sessions         map[[16]byte]*serverFlow
 	accountMu        sync.Mutex
-	accountSessions  map[string]int
+	accountUsage     map[string]*accountUsage
 	maxObservedLanes atomic.Int64
-	// refusals keeps the lane-join refusal record readable during a storm.
-	refusals refusalLog
-	budget   *limiter.Budget
-	metrics  *metrics.Registry
+	// These keep three kinds of record readable during a storm: lane-join
+	// refusals, account admission refusals, and enrollment or renewal
+	// attempts. All three are a stranger's to generate.
+	//
+	// They are three limiters rather than one because a storm in any of them
+	// must not suppress the others. The record an operator wants when a user
+	// says some sites load and others do not is the account one, and a peer
+	// hammering lane joins would otherwise bury it.
+	refusals        recordLimiter
+	accountRefusals recordLimiter
+	enrollLog       recordLimiter
+	budget          *limiter.Budget
+	metrics         *metrics.Registry
 	// udpRelays holds the relay sockets of UDP associations whose lane died,
 	// so the replacement association keeps the source address the destination
 	// has been talking to.
@@ -254,15 +263,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	budget := limiter.New(limiter.Config{TotalBytesPerSec: cfg.AggregateBytesPerSec, ReserveBytesPerSec: cfg.InteractiveReserveBytesPerSec})
 	cfg.ChunkSize = chunkSizeForBudget(cfg.ChunkSize, budget)
 	server := &Server{
-		cfg:             cfg,
-		semaphore:       make(chan struct{}, cfg.MaxSessions),
-		connections:     make(chan struct{}, cfg.MaxSessions),
-		enrollments:     make(chan struct{}, min(cfg.MaxSessions, 64)),
-		sessions:        make(map[[16]byte]*serverFlow),
-		accountSessions: make(map[string]int),
-		budget:          budget,
-		metrics:         cfg.Metrics,
-		udpRelays:       newUDPRelayStore(),
+		cfg:          cfg,
+		semaphore:    make(chan struct{}, cfg.MaxSessions),
+		connections:  make(chan struct{}, cfg.MaxSessions),
+		enrollments:  make(chan struct{}, min(cfg.MaxSessions, 64)),
+		sessions:     make(map[[16]byte]*serverFlow),
+		accountUsage: make(map[string]*accountUsage),
+		budget:       budget,
+		metrics:      cfg.Metrics,
+		udpRelays:    newUDPRelayStore(),
 	}
 	return server, nil
 }
@@ -295,22 +304,72 @@ func (s *Server) Serve(ctx context.Context) error {
 	return firstErr
 }
 
+// watchAuthorizationStore adopts authorization changes written by provider CLI
+// processes, and reports the state of that adoption.
+//
+// A failed refresh leaves the previous snapshot in force. That is the right
+// behaviour - a malformed or briefly unreadable file must not disarm a running
+// gateway - but it is also silent by construction: Authorize keeps admitting
+// established devices from the cached snapshot while every enrollment, which
+// re-reads from disk, fails. The gateway looks healthy from the outside and
+// the users who cannot enroll are told their invitations are bad.
+//
+// So the transitions are what get reported. The first failure is always
+// written, because it is the only record that says when this started;
+// continuing failures are restated at a bounded rate carrying how long it has
+// been going and how old the rules still in force are; and recovery is always
+// written, because a store that silently starts working again leaves an
+// operator reading an error with no ending.
 func (s *Server) watchAuthorizationStore(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var watch authorizationWatch
 	for {
 		select {
 		case <-ticker.C:
 			changed, err := s.cfg.Credentials.Store.Refresh()
+			now := time.Now()
 			if err != nil {
-				s.cfg.Logger.Error("authorization refresh failed; retaining last known-good state", "error", err)
-			} else if changed {
+				write, consecutive, suppressed, failingFor := watch.failed(now)
+				s.metrics.AuthorizationRefreshFailed(consecutive)
+				if !write {
+					continue
+				}
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+					"authorization refresh failed; retaining last known-good state",
+					slog.String("error", err.Error()),
+					slog.Uint64("consecutive", consecutive),
+					slog.Uint64("suppressed", suppressed),
+					slog.Int64("failing_for_seconds", int64(failingFor/time.Second)),
+					slog.Int64("enforcing_snapshot_age_seconds", s.authorizationSnapshotAge(now)))
+				continue
+			}
+			if recovered, attempts, unreadableFor := watch.succeeded(now); recovered {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"authorization refresh recovered",
+					slog.Uint64("failed_attempts", attempts),
+					slog.Int64("unreadable_for_seconds", int64(unreadableFor/time.Second)))
+			}
+			s.metrics.AuthorizationRefreshed(s.cfg.Credentials.Store.LastGoodAt(), changed)
+			if changed {
 				s.cfg.Logger.Info("authorization state reloaded")
 			}
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// authorizationSnapshotAge reports how old the authorization state currently
+// being enforced is, in seconds, or -1 if it has never been read. Enrollment
+// refreshes the same snapshot under its own lock, so the store is asked rather
+// than tracked here.
+func (s *Server) authorizationSnapshotAge(now time.Time) int64 {
+	lastGood := s.cfg.Credentials.Store.LastGoodAt()
+	if lastGood.IsZero() {
+		return -1
+	}
+	return int64(now.Sub(lastGood) / time.Second)
 }
 
 func (s *Server) serveTCP(ctx context.Context) error {
@@ -378,17 +437,27 @@ func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn) {
 	}
 	state := conn.ConnectionState()
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {
-		if s.cfg.Enrollment != nil && s.admitEnrollment() {
+		if s.cfg.Enrollment != nil {
+			if !s.admitEnrollment() {
+				s.recordEnrollmentAdmission("enrollment")
+				return
+			}
 			defer s.releaseEnrollment()
-			_ = s.cfg.Enrollment.Serve(conn)
+			result, err := s.cfg.Enrollment.Serve(conn)
+			s.recordEnrollment("enrollment", result, err)
 		}
 		return
 	}
 	if state.NegotiatedProtocol == identity.RenewalALPN {
-		if s.cfg.Enrollment != nil && s.admitEnrollment() {
+		if s.cfg.Enrollment != nil {
+			if !s.admitEnrollment() {
+				s.recordEnrollmentAdmission("renewal")
+				return
+			}
 			defer s.releaseEnrollment()
 			if principal, err := identity.PrincipalFromTLS(state); err == nil {
-				_ = s.cfg.Enrollment.Renew(conn, principal)
+				result, err := s.cfg.Enrollment.Renew(conn, principal)
+				s.recordEnrollment("renewal", result, err)
 			}
 		}
 		return
@@ -495,20 +564,29 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	})
 	state := conn.ConnectionState().TLS
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {
-		if s.cfg.Enrollment == nil || !s.admitEnrollment() {
+		if s.cfg.Enrollment == nil {
+			return
+		}
+		if !s.admitEnrollment() {
+			s.recordEnrollmentAdmission("enrollment")
 			return
 		}
 		defer s.releaseEnrollment()
 		stream, err := acceptQUICStream(ctx, conn, controller)
 		if err == nil {
 			_ = stream.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
-			_ = s.cfg.Enrollment.Serve(stream)
+			result, serveErr := s.cfg.Enrollment.Serve(stream)
+			s.recordEnrollment("enrollment", result, serveErr)
 			_ = stream.Close()
 		}
 		return
 	}
 	if state.NegotiatedProtocol == identity.RenewalALPN {
-		if s.cfg.Enrollment == nil || !s.admitEnrollment() {
+		if s.cfg.Enrollment == nil {
+			return
+		}
+		if !s.admitEnrollment() {
+			s.recordEnrollmentAdmission("renewal")
 			return
 		}
 		defer s.releaseEnrollment()
@@ -519,7 +597,8 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		stream, err := acceptQUICStream(ctx, conn, controller)
 		if err == nil {
 			_ = stream.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
-			_ = s.cfg.Enrollment.Renew(stream, principal)
+			result, renewErr := s.cfg.Enrollment.Renew(stream, principal)
+			s.recordEnrollment("renewal", result, renewErr)
 			_ = stream.Close()
 		}
 		return
@@ -612,11 +691,11 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetProtocol, "invalid flow open")})
 		return
 	}
-	if err := s.acquireAccountSession(principal); err != nil {
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "account session unavailable")})
+	if refusal := s.admitAccountFlow(principal); refusal != nil {
+		s.refuseAccountFlow(fc, sessionID, open.Header.FlowID, principal, refusal)
 		return
 	}
-	defer s.releaseAccountSession(principal.AccountID)
+	defer s.releaseAccountFlow(principal)
 	if session.IsUDPAssociation(open.Payload) {
 		s.handleUDPAssociation(ctx, conn, fc, principal, sessionID, open.Header.FlowID, nil, false)
 		return
@@ -794,41 +873,6 @@ func (s *Server) retainCompletedSession(sessionID [16]byte, serverSession *serve
 	})
 }
 
-// laneJoinRefusalLogInterval is how often one refusal reason is written to the
-// log while a storm is running. The first refusal of a reason is always
-// written; the ones a storm suppresses are counted and reported with the next.
-const laneJoinRefusalLogInterval = 10 * time.Second
-
-// refusalLog rate-limits the refusal record without keeping per-session state.
-//
-// Per session would read better in a log, but the session identifier in a
-// refused join is the peer's to choose: a map keyed by it is memory whose size
-// a peer decides, and a storm of refusals is exactly when a peer is producing
-// identifiers this endpoint has never seen. Per reason is bounded by the
-// reasons, and the suppressed count keeps the storm's size in the record.
-type refusalLog struct {
-	mu         sync.Mutex
-	last       [metrics.LaneJoinReasons]time.Time
-	suppressed [metrics.LaneJoinReasons]uint64
-}
-
-// due reports whether this reason should be written now, and how many of its
-// refusals went unwritten since the last time it was.
-func (l *refusalLog) due(reason metrics.LaneJoinRefusal, now time.Time) (bool, uint64) {
-	if reason < 0 || reason >= metrics.LaneJoinReasons {
-		return false, 0
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if last := l.last[reason]; !last.IsZero() && now.Sub(last) < laneJoinRefusalLogInterval {
-		l.suppressed[reason]++
-		return false, 0
-	}
-	suppressed := l.suppressed[reason]
-	l.last[reason], l.suppressed[reason] = now, 0
-	return true, suppressed
-}
-
 // refuseLaneJoin answers a lane join with a reset, and says so where an
 // operator will see it.
 //
@@ -839,7 +883,7 @@ func (l *refusalLog) due(reason metrics.LaneJoinRefusal, now time.Time) (bool, u
 // it belongs at the level a failing flow is reported at.
 func (s *Server) refuseLaneJoin(fc *frameConn, sessionID [16]byte, flowID, laneID uint64, reason metrics.LaneJoinRefusal, code session.ResetCode, message string) {
 	s.metrics.LaneJoinRefused(reason)
-	if write, suppressed := s.refusals.due(reason, time.Now()); write {
+	if write, suppressed, total := s.refusals.due(reason, time.Now()); write {
 		level := slog.LevelInfo
 		if reason == metrics.LaneJoinPrincipalMismatch || reason == metrics.LaneJoinFlowMismatch {
 			// Not a lost session: a peer that authenticated is naming a live
@@ -852,7 +896,8 @@ func (s *Server) refuseLaneJoin(fc *frameConn, sessionID [16]byte, flowID, laneI
 			slog.String("reason", reason.String()),
 			slog.Uint64("lane", laneID),
 			slog.Uint64("flow_id", flowID),
-			slog.Uint64("suppressed", suppressed))
+			slog.Uint64("suppressed", suppressed),
+			slog.Uint64("total", total))
 	}
 	_ = fc.Write(protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID,
@@ -978,29 +1023,123 @@ func samePrincipal(a, b identity.Principal) bool {
 	return a.ProviderID == b.ProviderID && a.AccountID == b.AccountID && a.DeviceID == b.DeviceID
 }
 
-func (s *Server) acquireAccountSession(principal identity.Principal) error {
+// accountUsage is one account's live admission state: how many flows it holds
+// and which of its devices are holding them. The device counts are what make
+// a client limit a limit on devices rather than on flows -- a device that
+// holds two hundred flows is still one client.
+type accountUsage struct {
+	flows   int
+	devices map[string]int
+}
+
+// accountRefusal is a flow open refused by the opening account's own policy
+// rather than by the gateway's capacity. It carries the reason for the counter
+// and the log, and the code and message for the RESET.
+//
+// The message names the limit that was hit. That matters more than it looks:
+// the peer is where this refusal is first seen, frequently by someone who
+// cannot read the gateway's logs, and a message that does not distinguish
+// "this account is out of flows" from "this account is out of device slots"
+// sends them looking in the wrong place.
+type accountRefusal struct {
+	reason  metrics.AccountRefusal
+	code    session.ResetCode
+	message string
+}
+
+func (r *accountRefusal) Error() string { return r.message }
+
+var (
+	errAccountFlowLimit = &accountRefusal{
+		reason: metrics.AccountRefusalFlowLimit, code: session.ResetFlowLimit,
+		message: "account flow limit reached",
+	}
+	errAccountClientLimit = &accountRefusal{
+		reason: metrics.AccountRefusalClientLimit, code: session.ResetFlowLimit,
+		message: "account device limit reached",
+	}
+	errAccountUnauthorized = &accountRefusal{
+		reason: metrics.AccountRefusalUnauthorized, code: session.ResetAuthentication,
+		message: "device is not authorized",
+	}
+)
+
+// admitAccountFlow reserves one flow against the opening account's policy, and
+// counts the opening device against the account's client limit. A device
+// already holding a flow is already counted, so an existing client is never
+// refused by the client limit however many flows it opens.
+func (s *Server) admitAccountFlow(principal identity.Principal) *accountRefusal {
 	authorization, err := s.cfg.Credentials.Store.Authorize(principal, time.Now())
 	if err != nil {
-		return err
+		return errAccountUnauthorized
 	}
+	limits := authorization.Account.Limits()
 	s.accountMu.Lock()
 	defer s.accountMu.Unlock()
-	active := s.accountSessions[principal.AccountID]
-	if authorization.Account.MaxSessions > 0 && active >= authorization.Account.MaxSessions {
-		return errors.New("account session limit reached")
+	usage := s.accountUsage[principal.AccountID]
+	flows, clients, known := 0, 0, false
+	if usage != nil {
+		flows, clients = usage.flows, len(usage.devices)
+		_, known = usage.devices[principal.DeviceID]
 	}
-	s.accountSessions[principal.AccountID] = active + 1
+	if limits.MaxFlows > 0 && flows >= limits.MaxFlows {
+		return errAccountFlowLimit
+	}
+	if limits.MaxClients > 0 && !known && clients >= limits.MaxClients {
+		return errAccountClientLimit
+	}
+	// Nothing is recorded until the open is admitted, so a refused open
+	// leaves no entry behind for an account that holds no flows.
+	if usage == nil {
+		usage = &accountUsage{devices: make(map[string]int)}
+		s.accountUsage[principal.AccountID] = usage
+	}
+	usage.flows++
+	usage.devices[principal.DeviceID]++
 	return nil
 }
 
-func (s *Server) releaseAccountSession(accountID string) {
+func (s *Server) releaseAccountFlow(principal identity.Principal) {
 	s.accountMu.Lock()
 	defer s.accountMu.Unlock()
-	if active := s.accountSessions[accountID]; active <= 1 {
-		delete(s.accountSessions, accountID)
-	} else {
-		s.accountSessions[accountID] = active - 1
+	usage := s.accountUsage[principal.AccountID]
+	if usage == nil {
+		return
 	}
+	if usage.flows <= 1 {
+		delete(s.accountUsage, principal.AccountID)
+		return
+	}
+	usage.flows--
+	if usage.devices[principal.DeviceID] <= 1 {
+		delete(usage.devices, principal.DeviceID)
+		return
+	}
+	usage.devices[principal.DeviceID]--
+}
+
+// refuseAccountFlow answers a flow open with a reset, and says so where an
+// operator will see it.
+//
+// This path used to be silent at every log level and carried no counter, so a
+// gateway refusing every second open an account made looked completely
+// healthy. The account whose limit was hit is named because that is the only
+// thing an operator can act on, and it is not a secret from the operator who
+// set the limit.
+func (s *Server) refuseAccountFlow(fc *frameConn, sessionID [16]byte, flowID uint64, principal identity.Principal, refusal *accountRefusal) {
+	s.metrics.AccountAdmissionRefused(refusal.reason)
+	if write, suppressed, total := s.accountRefusals.due(refusal.reason, time.Now()); write {
+		s.cfg.Logger.LogAttrs(context.Background(), slog.LevelWarn, "account flow open refused",
+			slog.String("reason", refusal.reason.String()),
+			slog.String("account", principal.AccountID),
+			slog.String("device", principal.DeviceID),
+			slog.Uint64("suppressed", suppressed),
+			slog.Uint64("total", total))
+	}
+	_ = fc.Write(protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID,
+		FlowID: flowID, Class: protocol.ClassNew,
+	}, Payload: session.ResetPayload(refusal.code, refusal.message)})
 }
 
 // watchAuthorization applies revocation and account expiry to already-open

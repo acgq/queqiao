@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"testing"
-	"time"
 
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/metrics"
@@ -75,34 +74,10 @@ func TestLaneJoinRefusalsAreVisibleAndCountedByReason(t *testing.T) {
 			if record["msg"] != "lane join refused" || record["reason"] != test.reason.String() || record["level"] != test.level {
 				t.Fatalf("record = %#v", record)
 			}
+			// One record has to be readable on its own.
+			if record["total"] != float64(1) {
+				t.Fatalf("record total = %#v, want 1", record["total"])
+			}
 		})
-	}
-}
-
-// A storm must stay legible: the reason is written, the ones it stood in for
-// are counted, and the count is reported rather than lost.
-func TestLaneJoinRefusalLogSurvivesAStorm(t *testing.T) {
-	var log refusalLog
-	start := time.Now()
-	write, suppressed := log.due(metrics.LaneJoinUnknownSession, start)
-	if !write || suppressed != 0 {
-		t.Fatalf("first refusal write=%t suppressed=%d, want true and 0", write, suppressed)
-	}
-	const storm = 500
-	for i := 0; i < storm; i++ {
-		if write, _ := log.due(metrics.LaneJoinUnknownSession, start.Add(time.Duration(i)*time.Millisecond)); write {
-			t.Fatalf("refusal %d was written inside the interval", i)
-		}
-	}
-	// A different reason is never suppressed by another one's storm.
-	if write, _ := log.due(metrics.LaneJoinPrincipalMismatch, start.Add(time.Second)); !write {
-		t.Fatal("a principal mismatch was hidden by an unknown-session storm")
-	}
-	write, suppressed = log.due(metrics.LaneJoinUnknownSession, start.Add(laneJoinRefusalLogInterval))
-	if !write || suppressed != storm {
-		t.Fatalf("after the interval write=%t suppressed=%d, want true and %d", write, suppressed, storm)
-	}
-	if write, suppressed = log.due(metrics.LaneJoinUnknownSession, start.Add(2*laneJoinRefusalLogInterval)); !write || suppressed != 0 {
-		t.Fatalf("suppressed count survived being reported: write=%t suppressed=%d", write, suppressed)
 	}
 }

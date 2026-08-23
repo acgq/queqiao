@@ -110,7 +110,7 @@ Prometheus `/metrics` names. They cover:
 - transient local UDP send errors absorbed into QUIC loss recovery;
 - flow telemetry entries expired because nothing refreshed them, which is how
   a round-trip aggregate frozen at a stale constant announces itself;
-- lane joins refused, split by reason; and
+- lane joins refused and account flow opens refused, each split by reason; and
 - the controller's measured erasure floor, sampler diagnostics, and class
   transitions.
 
@@ -128,6 +128,15 @@ each record carries how many refusals of that reason it stands for in
 `suppressed`. The matching counters are `queqiao_lane_join_refused_total` by
 reason.
 
+A gateway that refuses a flow open because of the opening account's own limits
+writes `msg="account flow open refused"` at `warn`, naming the `reason` --
+`flow_limit`, `client_limit`, or `unauthorized` -- with the account and device.
+It is rate limited and counted the same way, with `suppressed` and `total` in
+each record and `queqiao_account_admission_refused_total` by reason. This is
+the record to look for when a user reports that most sites load and a few do
+not: an account whose flow limit is too low for a browser fails exactly that
+way, and the flow limit counts connections rather than devices.
+
 Flow-completion records add an opaque session/flow correlation ID, transport,
 duration, directional bytes, class, lane byte
 allocation, coded-versus-stream payload, and the FEC sent/repair/recovered/
@@ -138,10 +147,26 @@ other. `fec_sent_total` and `fec_repairs_total` are what this endpoint
 transmitted; `fec_arrived_total`, `fec_recovered_total` and
 `fec_residual_lost_total` are what it received, so on an asymmetric flow
 `lost` above `sent` is ordinary rather than impossible. The receive direction's
-rates are `fec_measured_erasure`, the share of the peer's source symbols that
-did not arrive, and `fec_residual_loss`, the share the code could not repair
-and the session had to re-issue. Both are taken over `fec_source_symbols_total`
-and are therefore in [0,1]. Failed flows are warning-level records with the
+rates are `fec_receive_erasure`, the share of the peer's source symbols that
+did not arrive, and `fec_receive_residual_loss`, the share the code could not
+repair and the session had to re-issue. Both are taken over
+`fec_source_symbols_total` and are therefore in [0,1]. The `coded_substrate`
+summary string carries the same two as `recv_residual` and `recv_erasure`.
+
+An endpoint therefore reports three different erasure figures, and comparing
+them without knowing which direction each measures is how an asymmetric path
+reads as a fault:
+
+| Field | Direction | Measured from |
+| --- | --- | --- |
+| `fec_receive_erasure` | what this endpoint receives | source symbols the decoder accounted for |
+| `fec_observed_loss` | what this endpoint receives | gaps in the peer's transmission sequence |
+| `queqiao_quic_controller_erasure_floor_ratio` | what this endpoint sends into | the controller's own acknowledgements |
+
+On a path whose downstream erases and whose upstream does not, the first two
+are large while the third is near zero, and all three are correct. The
+controller's floor is the one that sizes this endpoint's parity, because the
+direction a sender codes for is the direction it sends into. Failed flows are warning-level records with the
 same performance and FEC fields plus the error, so they remain visible at the
 default `info` level. `QUEQIAO_LANE_TRACE=1` remains an opt-in raw
 per-lane diagnostic. It is not needed for the standard aggregate dashboard.

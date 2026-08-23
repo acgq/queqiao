@@ -43,7 +43,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("a command is required: provider, enroll, client, server, logs, or version")
+		return errors.New("a command is required: provider, enroll, client, service, server, logs, or version")
 	}
 	switch args[0] {
 	case "version", "--version", "-version":
@@ -62,8 +62,10 @@ func run(args []string) error {
 		return runServer(args[1:])
 	case "logs":
 		return runLogs(args[1:])
+	case "service":
+		return runService(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; want provider, enroll, client, server, logs, or version", args[0])
+		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, logs, or version", args[0])
 	}
 }
 
@@ -71,6 +73,28 @@ func newFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	return fs
+}
+
+// flagWasSet reports whether the operator named this flag, as opposed to it
+// holding its default. A limit the operator did not name must keep its current
+// value rather than being reset to a default.
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// describeLimit renders a limit for an operator, spelling out what zero means
+// instead of printing a zero that reads like "none allowed".
+func describeLimit(value int, unlimited string) string {
+	if value == 0 {
+		return fmt.Sprintf("0 (%s)", unlimited)
+	}
+	return fmt.Sprintf("%d", value)
 }
 
 func requireNoArguments(fs *flag.FlagSet) error {
@@ -82,7 +106,7 @@ func requireNoArguments(fs *flag.FlagSet) error {
 
 func runProvider(args []string) error {
 	if len(args) == 0 {
-		return errors.New("provider command is required: init, add-user, list-users, invite, list-invites, revoke-invite, list-devices, revoke-device, enable-user, or disable-user")
+		return errors.New("provider command is required: init, add-user, list-users, set-user-limits, invite, list-invites, revoke-invite, list-devices, revoke-device, enable-user, or disable-user")
 	}
 	switch args[0] {
 	case "init":
@@ -110,7 +134,9 @@ func runProvider(args []string) error {
 		state := fs.String("state", "", "provider state directory")
 		name := fs.String("name", "", "unique user name")
 		expiresIn := fs.Duration("expires-in", 0, "optional account lifetime (0 never expires)")
-		maxSessions := fs.Int("max-sessions", 0, "concurrent flows for this user (0 uses provider limit)")
+		maxFlows := fs.Int("max-flows", identity.DefaultAccountMaxFlows, "concurrent proxied flows for this user (0 uses the gateway limit)")
+		maxClients := fs.Int("max-clients", identity.DefaultAccountMaxClients, "concurrent devices for this user (0 allows every enrolled device)")
+		maxSessions := fs.Int("max-sessions", 0, "deprecated name for --max-flows")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -128,11 +154,20 @@ func runProvider(args []string) error {
 		if *expiresIn > 0 {
 			expires = time.Now().Add(*expiresIn)
 		}
-		account, err := provider.Store.AddAccount(*name, expires, *maxSessions, time.Now())
+		limits := identity.AccountLimits{MaxFlows: *maxFlows, MaxClients: *maxClients}
+		if flagWasSet(fs, "max-sessions") {
+			if flagWasSet(fs, "max-flows") {
+				return errors.New("--max-sessions is the former name of --max-flows; set only one")
+			}
+			fmt.Fprintln(os.Stderr, "queqiaod: --max-sessions is deprecated and renamed --max-flows. It counts concurrent flows, not devices: one flow is one TCP connection or one UDP association, and a browser needs hundreds. Use --max-clients to limit devices.")
+			limits.MaxFlows = *maxSessions
+		}
+		account, err := provider.Store.AddAccount(*name, expires, limits, time.Now())
 		if err != nil {
 			return err
 		}
-		fmt.Printf("User %q created.\nID: %s\n", account.Name, account.ID)
+		fmt.Printf("User %q created.\nID: %s\nFlows: %s\nClients: %s\n",
+			account.Name, account.ID, describeLimit(account.MaxFlows, "gateway limit"), describeLimit(account.MaxClients, "every enrolled device"))
 		return nil
 	case "list-users":
 		fs := newFlagSet("provider list-users")
@@ -147,14 +182,53 @@ func runProvider(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println("ID\tNAME\tENABLED\tEXPIRES\tMAX_SESSIONS")
+		fmt.Println("ID\tNAME\tENABLED\tEXPIRES\tMAX_FLOWS\tMAX_CLIENTS")
 		for _, account := range provider.Store.Accounts() {
 			expires := account.ExpiresAt
 			if expires == "" {
 				expires = "never"
 			}
-			fmt.Printf("%s\t%s\t%t\t%s\t%d\n", account.ID, account.Name, account.Enabled, expires, account.MaxSessions)
+			fmt.Printf("%s\t%s\t%t\t%s\t%d\t%d\n", account.ID, account.Name, account.Enabled, expires, account.MaxFlows, account.MaxClients)
 		}
+		return nil
+	case "set-user-limits":
+		fs := newFlagSet("provider set-user-limits")
+		state := fs.String("state", "", "provider state directory")
+		user := fs.String("user", "", "user name or ID")
+		maxFlows := fs.Int("max-flows", 0, "concurrent proxied flows for this user, unchanged if not given (0 uses the gateway limit)")
+		maxClients := fs.Int("max-clients", 0, "concurrent devices for this user, unchanged if not given (0 allows every enrolled device)")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if err := requireNoArguments(fs); err != nil {
+			return err
+		}
+		if !flagWasSet(fs, "max-flows") && !flagWasSet(fs, "max-clients") {
+			return errors.New("set at least one of --max-flows or --max-clients")
+		}
+		provider, err := loadProviderRequired(*state)
+		if err != nil {
+			return err
+		}
+		account, ok := provider.Store.FindAccount(*user)
+		if !ok {
+			return errors.New("unknown user")
+		}
+		// An unnamed limit keeps its current value. Correcting one limit is
+		// the common case, and defaulting the other to this build's default
+		// would silently rewrite a policy the operator did not mention.
+		limits := account.Limits()
+		if flagWasSet(fs, "max-flows") {
+			limits.MaxFlows = *maxFlows
+		}
+		if flagWasSet(fs, "max-clients") {
+			limits.MaxClients = *maxClients
+		}
+		if err := provider.Store.SetAccountLimits(account.ID, limits); err != nil {
+			return err
+		}
+		fmt.Printf("User %q limits updated.\nFlows: %s\nClients: %s\n",
+			account.Name, describeLimit(limits.MaxFlows, "gateway limit"), describeLimit(limits.MaxClients, "every enrolled device"))
 		return nil
 	case "invite":
 		fs := newFlagSet("provider invite")
@@ -411,7 +485,7 @@ func runEnroll(args []string) error {
 	if err := os.Remove(pendingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("profile was saved successfully at %s, but the completed draft %s still contains private credentials and must be removed: %w", *profilePath, pendingPath, err)
 	}
-	fmt.Printf("Enrolled %q as device %q.\nProfile: %s\nSOCKS: queqiaod client --profile %q\n", profile.Name, profile.DeviceName, *profilePath, *profilePath)
+	fmt.Printf("Enrolled %q as device %q.\nProfile: %s\nSOCKS: queqiaod client --profile %q\nService: queqiaod service install --profile %q\n", profile.Name, profile.DeviceName, *profilePath, *profilePath, *profilePath)
 	return nil
 }
 
@@ -440,7 +514,11 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	defaultListen := ":443"
 	defaultMaxSessions := 4096
 	if client {
-		defaultListen, defaultMaxSessions = "127.0.0.1:1080", 2048
+		// 12080 rather than the conventional 1080: deploy/clash-queqiao.yaml
+		// and the deployment guide both point Clash at that port, and a
+		// default that disagrees with the profile shipped beside it turns
+		// every unconfigured start into a silent no-route.
+		defaultListen, defaultMaxSessions = "127.0.0.1:12080", 2048
 	}
 	fs.StringVar(&opts.listen, "listen", defaultListen, "listen address")
 	fs.IntVar(&opts.maxSessions, "max-sessions", defaultMaxSessions, "global concurrent-session limit")
@@ -899,6 +977,10 @@ func logPerformanceSnapshot(logger *slog.Logger, s metrics.Snapshot, interval ti
 		slog.Uint64("queqiao_udp_association_rescue_failures_total", s.UDPAssociationRescueFailures),
 		slog.Uint64("queqiao_completion_timeouts_total", s.CompletionTimeouts),
 		slog.Uint64("queqiao_flow_timeouts_total", s.FlowTimeouts),
+		slog.Uint64("queqiao_authorization_refresh_failures_total", s.AuthorizationRefreshFailures),
+		slog.Uint64("queqiao_authorization_reloads_total", s.AuthorizationReloads),
+		slog.Uint64("queqiao_authorization_consecutive_refresh_failures", s.AuthorizationConsecutiveRefreshFailures),
+		slog.Int64("queqiao_authorization_last_good_timestamp_seconds", s.AuthorizationLastGoodUnix),
 		slog.Int64("queqiao_replay_bytes_in_use", s.ReplayBytesInUse),
 		slog.Uint64("queqiao_bulk_isolations_total", s.BulkIsolations),
 		slog.Uint64("queqiao_lane_reinjections_total", s.Reinjections),
