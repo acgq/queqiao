@@ -116,6 +116,8 @@ workload; see the full [comparison and methodology](docs/COMPARISON.md).
 - A starter [Clash/mihomo profile](deploy/clash-queqiao.yaml).
 - One client process serving several providers, each on its own loopback SOCKS5
   listener, for Clash/mihomo routing and failover.
+- Optional gateway-side chaining through a loopback SOCKS5 upstream, including
+  UDP ASSOCIATE, so sing-box can select the final egress.
 - Bounded JSON logs, metrics, a local visualizer, deterministic benchmarks,
   release packaging, SBOMs, and rollback procedures.
 
@@ -159,6 +161,10 @@ sudo ./queqiaod server \
   --state /var/lib/queqiao/provider \
   --listen :443
 ```
+
+To hand gateway destination traffic to a local sing-box SOCKS5 inbound, add
+`--outbound-socks5 127.0.0.1:1080`. See the deployment guide for routing and
+DNS limitations.
 
 Send the printed `queqiao://` URI to the user over a private channel. On the
 client:

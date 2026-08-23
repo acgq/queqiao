@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -415,7 +416,7 @@ func runEnroll(args []string) error {
 }
 
 type runtimeOptions struct {
-	listen, localAddress, transport, tcpCongestion                  string
+	listen, localAddress, transport, tcpCongestion, outboundSOCKS5  string
 	maxSessions, maxPendingOpens, tcpFallbackLanes                  int
 	chunkSize                                                       int
 	dialTimeout, handshakeTimeout, flowIdleTimeout, flowMaxLifetime time.Duration
@@ -478,6 +479,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	} else {
 		fs.StringVar(&opts.tcpCongestion, "tcp-congestion", "system", "server TCP congestion controller")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
+		fs.StringVar(&opts.outboundSOCKS5, "outbound-socks5", "", "optional loopback SOCKS5 upstream for destination traffic")
 	}
 }
 
@@ -553,6 +555,14 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	if client {
 		if err := netbind.Validate(opts.localAddress); err != nil {
 			return fmt.Errorf("invalid --local-address: %w", err)
+		}
+	}
+	if !client && opts.outboundSOCKS5 != "" {
+		host, port, err := net.SplitHostPort(opts.outboundSOCKS5)
+		ip := net.ParseIP(host)
+		portNumber, portErr := strconv.Atoi(port)
+		if err != nil || ip == nil || !ip.IsLoopback() || portErr != nil || portNumber < 1 || portNumber > 65535 {
+			return errors.New("server --outbound-socks5 must use a literal loopback IP and non-zero port")
 		}
 	}
 	return nil
@@ -663,7 +673,7 @@ func runServer(args []string) (returnErr error) {
 		ChunkSize:        opts.chunkSize,
 		HandshakeTimeout: opts.handshakeTimeout, FlowIdleTimeout: opts.flowIdleTimeout,
 		FlowMaxLifetime: opts.flowMaxLifetime, MaxSessions: opts.maxSessions,
-		DestinationPolicy: pep.DestinationPolicy{AllowPrivate: opts.allowPrivate, DialTimeout: opts.dialTimeout},
+		DestinationPolicy: pep.DestinationPolicy{AllowPrivate: opts.allowPrivate, DialTimeout: opts.dialTimeout, OutboundSOCKS5: opts.outboundSOCKS5},
 		EnableTCP:         opts.transport == string(pep.TransportTCP) || opts.transport == string(pep.TransportAuto),
 		EnableQUIC:        opts.transport == string(pep.TransportQUIC) || opts.transport == string(pep.TransportAuto),
 		TCPFallbackLanes:  opts.tcpFallbackLanes, TCPCongestion: opts.tcpCongestion,
@@ -807,6 +817,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		attrs = append(attrs,
 			slog.String("tcp_congestion", opts.tcpCongestion),
 			slog.Bool("allow_private_destinations", opts.allowPrivate),
+			slog.String("outbound_socks5", opts.outboundSOCKS5),
 		)
 	}
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "runtime configuration", attrs...)

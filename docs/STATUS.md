@@ -4,7 +4,7 @@
 > **Release level:** Public-preview source tree; no production-ready claim
 >
 > **Wire protocol:** Version 1 only; incompatible versions fail closed
-> **Last reviewed:** 2026-08-20
+> **Last reviewed:** 2026-08-23
 
 Queqiao is ready to build and use from source for its supported paired-gateway
 topology. It is not a universal acceleration layer and it does not promise the
@@ -35,7 +35,7 @@ limitations](KNOWN-LIMITATIONS.md) before deploying it.
 
 | Area | Current capability |
 | --- | --- |
-| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback |
+| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback; optional gateway chaining through a loopback SOCKS5 upstream |
 | WAN policy | shared endpoint-pair path model, erasure-aware control, aggregate pacing, and interactive reserve |
 | Recovery | byte-offset reassembly, range acknowledgements, bounded replay, sliding-window coding, lane replacement, and UDP relay reclamation |
 | Contention | behavioral flow state, priority queues, reactive bulk isolation, and bounded opt-in TCP fallback striping |

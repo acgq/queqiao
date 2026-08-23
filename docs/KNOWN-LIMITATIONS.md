@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status:** Current limitations for public protocol 1
-> **Last reviewed:** 2026-08-20
+> **Last reviewed:** 2026-08-23
 
 These are the boundaries of the ready-to-use public-preview deployment. Read
 them before treating a successful local test as evidence that a different
@@ -53,6 +53,12 @@ qualification items are still open.
   cannot recover datagrams in flight during path failure.
 - Automatic TCP fallback cannot bypass a network that blocks both transports
   or the selected gateway port.
+- The optional gateway SOCKS5 upstream is unauthenticated and loopback-only.
+  Queqiao validates the gateway's current DNS answers and then preserves the
+  original domain for upstream routing, so the trusted upstream's final DNS
+  answer is a second resolution outside that initial check. The upstream must
+  support UDP ASSOCIATE for UDP traffic, and there is no silent direct
+  fallback.
 - `--allow-private-destinations` removes the default SSRF boundary and should
   be used only for an intentional private-access service.
 - The desktop SOCKS listener is intentionally loopback-only and has no remote
