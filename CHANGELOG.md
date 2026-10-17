@@ -25,6 +25,12 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
   Delayed replay of already-delivered bytes after FIN is acknowledged instead
   of aborting a completed response; data extending past FIN remains an error.
 
+### Security
+
+- Update the desktop, server, and mobile build toolchains to Go 1.26.9 and
+  upgrade golang.org/x/net to v0.60.0 with its companion dependencies to address
+  upstream security vulnerabilities.
+
 ## v0.8.0 - 2026-09-19
 
 ### Added
