@@ -1511,7 +1511,10 @@ func serveClearTextH2(addr string, config *http.HTTP2Config, handler http.Handle
 	defer ln.Close()
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
-	server := &http.Server{Handler: handler, Protocols: protocols, HTTP2: config}
+	server := &http.Server{
+		Handler: handler, Protocols: protocols, HTTP2: config,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	return server.Serve(ln)
 }
 

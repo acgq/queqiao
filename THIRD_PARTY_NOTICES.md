@@ -10,9 +10,9 @@ following Go modules:
 | `github.com/klauspost/compress` | v1.18.7 | BSD-3-Clause |
 | `github.com/refraction-networking/utls` | v1.8.2 | BSD-3-Clause |
 | `github.com/skip2/go-qrcode` | v0.0.0-20200617195104-da1b6568686e | MIT |
-| `golang.org/x/crypto` | v0.55.0 | BSD-3-Clause |
-| `golang.org/x/net` | v0.58.0 | BSD-3-Clause |
-| `golang.org/x/sys` | v0.47.0 | BSD-3-Clause |
+| `golang.org/x/crypto` | v0.57.0 | BSD-3-Clause |
+| `golang.org/x/net` | v0.60.0 | BSD-3-Clause |
+| `golang.org/x/sys` | v0.48.0 | BSD-3-Clause |
 
 Every release archive contains `THIRD_PARTY_LICENSES.txt` with the complete
 license text read from the exact linked module versions at packaging time. Its
