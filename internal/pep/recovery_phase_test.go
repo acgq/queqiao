@@ -75,7 +75,7 @@ func TestRecoveryTCPFollowsFailedQUICPhase(t *testing.T) {
 				}
 			}
 			lane, err := client.raceRescueWithFallback(ctx, flow, []rescueAttempt{attempt, attempt}, func(ctx context.Context) (*mpLane, error) { tcpCalls.Add(1); return tcp, nil })
-			wantTCP := mode == "failed" || mode == "deadline" || mode == "peer-tcp"
+			wantTCP := mode == "failed" || mode == "deadline" || mode == "peer-tcp" || mode == "capacity"
 			if wantTCP {
 				if err != nil || lane != tcp || tcpCalls.Load() != 1 {
 					t.Fatalf("lane=%v error=%v TCP calls=%d", lane, err, tcpCalls.Load())
