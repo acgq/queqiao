@@ -150,11 +150,9 @@ func TestAutoRecoveryCommitsToTCPWhenPeerSaysFlowIsOnTCP(t *testing.T) {
 	}
 }
 
-// One capacity answer is the ordinary loser of a rescue race, so the AUTO
-// TCP commit stays suppressed for it. When the answer repeats with no
-// successful round between, a wedged admission slot on the peer is the
-// likelier reading, and the commit stops being suppressed.
-func TestPersistentCapacityAnswerLetsAutoCommitToTCP(t *testing.T) {
+// Once the QUIC race has exhausted its candidates, AUTO can hand off to TCP
+// immediately; repeating the same capacity refusal adds no useful evidence.
+func TestCapacityAnswerLetsAutoCommitToTCPImmediately(t *testing.T) {
 	rig := newJoinTestRig(t, TransportAuto, TransportQUIC, 4)
 	// Fill the ceiling with lanes too young to evict, so every JOIN is
 	// answered with the transient capacity refusal. The ids stay clear of the
@@ -172,17 +170,12 @@ func TestPersistentCapacityAnswerLetsAutoCommitToTCP(t *testing.T) {
 	if err := flow.addLane(isolationLane(t, 0)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rig.client.openRescueLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID); !errors.Is(err, errLaneJoinCapacity) {
-		t.Fatalf("first capacity answer = %v, want %v", err, errLaneJoinCapacity)
-	}
-	flow.noteLaneCapacityRefusal()
-	flow.noteLaneCapacityRefusal()
 	lane, err := rig.client.openRescueLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lane.kind != TransportTCP {
-		t.Fatalf("recovery lane transport = %s, want TCP once the answer repeated", lane.kind)
+		t.Fatalf("recovery lane transport = %s, want immediate TCP handoff", lane.kind)
 	}
 	if !rig.serverSess.tcpMode {
 		t.Fatal("server flow did not commit to TCP")
