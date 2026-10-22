@@ -514,6 +514,7 @@ type runtimeOptions struct {
 	flowMetadataSocket                                              string
 	classHints                                                      repeatedFlag
 	outboundSOCKS5                                                  string
+	quicV2Only                                                      bool
 	// resolvedProfile is the deployment policy, parsed once at flag time so
 	// that an unknown name fails before anything starts rather than being
 	// silently replaced by the default.
@@ -591,6 +592,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this gateway serves: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
 		fs.StringVar(&opts.outboundSOCKS5, "outbound-socks5", "", "optional loopback SOCKS5 upstream for destination traffic")
+		fs.BoolVar(&opts.quicV2Only, "quic-v2-only", false, "require QUIC v2; dual-version clients negotiate v2, clients without v2 need TCP fallback")
 	}
 }
 
@@ -819,6 +821,7 @@ func runServer(args []string) (returnErr error) {
 		DestinationPolicy: pep.DestinationPolicy{AllowPrivate: opts.allowPrivate, DialTimeout: opts.dialTimeout, OutboundSOCKS5: opts.outboundSOCKS5},
 		EnableTCP:         opts.transport == string(pep.TransportTCP) || opts.transport == string(pep.TransportAuto),
 		EnableQUIC:        opts.transport == string(pep.TransportQUIC) || opts.transport == string(pep.TransportAuto),
+		QUICV2Only:        opts.quicV2Only,
 		TCPFallbackLanes:  opts.tcpFallbackLanes, TCPCongestion: opts.tcpCongestion,
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
@@ -964,6 +967,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 			slog.String("tcp_congestion", opts.tcpCongestion),
 			slog.Bool("allow_private_destinations", opts.allowPrivate),
 			slog.String("outbound_socks5", opts.outboundSOCKS5),
+			slog.Bool("quic_v2_only", opts.quicV2Only),
 		)
 	}
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "runtime configuration", attrs...)

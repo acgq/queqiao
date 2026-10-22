@@ -44,6 +44,9 @@ type ServerConfig struct {
 	DestinationPolicy DestinationPolicy
 	EnableTCP         bool
 	EnableQUIC        bool
+	// QUICV2Only makes dual-version clients negotiate v2 before TLS, avoiding
+	// paths that rewrite v1 Initials. Clients without v2 require TCP fallback.
+	QUICV2Only bool
 	// TCPFallbackLanes is the admission ceiling for one negotiated TCP-only
 	// flow. The client chooses the active target; keeping the server ceiling at
 	// 16 lets operators compare 8 and 16 without changing the gateway.
@@ -558,8 +561,11 @@ func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn)
 		_ = packetConn.Close()
 		return fmt.Errorf("configure server TLS identity: %w", err)
 	}
-	listener, err := quic.Listen(packetConn, tlsConfig, quicServerConfig(
-		flowWindows{stream: s.cfg.StreamReceiveWindow, connection: s.cfg.ConnectionReceiveWindow}))
+	quicCfg := quicServerConfig(flowWindows{stream: s.cfg.StreamReceiveWindow, connection: s.cfg.ConnectionReceiveWindow})
+	if s.cfg.QUICV2Only {
+		quicCfg.Versions = []quic.Version{quic.Version2}
+	}
+	listener, err := quic.Listen(packetConn, tlsConfig, quicCfg)
 	if err != nil {
 		_ = packetConn.Close()
 		return fmt.Errorf("create QUIC listener: %w", err)

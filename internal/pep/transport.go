@@ -572,6 +572,10 @@ func (w flowWindows) validate() error {
 func quicConfig(windows flowWindows) *quic.Config {
 	streamWindow, connectionWindow, streamMax, connectionMax, incomingStreams := windows.resolved()
 	return &quic.Config{
+		// Prefer v2 to avoid paths that rewrite v1 ClientHello ALPN as h3.
+		// Keep v1 for negotiation with older peers. Both retain the same
+		// Queqiao ALPN and mutual authentication.
+		Versions: []quic.Version{quic.Version2, quic.Version1},
 		// The handshake gets as long as an erasing path needs.
 		//
 		// On the channel this targets the handshake itself takes about five
