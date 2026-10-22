@@ -10,22 +10,889 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
-- The gateway reports how stale its authorization state is. A failed refresh
-  leaves the previous snapshot in force, which is correct - a briefly
-  unreadable file must not disarm a running gateway - but it was also silent:
-  the refresh runs once a second and wrote 86,400 identical error lines a day,
-  none of which said when the run started, how long it had been going, or how
-  old the rules still being enforced were, and no metric covered any of it. The
-  store now records when its snapshot was last read from disk, the run is
-  reported at its edges - always on the first failure, restated at most once a
-  minute with the run length and the age of the snapshot in force, and always
-  on recovery - and four series are exported:
-  `queqiao_authorization_refresh_failures_total`,
-  `queqiao_authorization_reloads_total`,
-  `queqiao_authorization_consecutive_refresh_failures`, and
-  `queqiao_authorization_last_good_timestamp_seconds`. This is the fault that
-  keeps every existing device working while refusing every new enrollment, so
-  nothing else in the flow counters moves when it happens.
+## v0.10.0 - 2026-10-19
+
+### Fixed
+
+- Keep reverse-direction ACKs readable when application delivery fills the
+  receive event queue, using a bounded overflow queue. Frame-write deadlines
+  now include writer-lock waits and cancellation interrupts blocked writes.
+  Repeated selective ACKs no longer reset the stall detector, and ranges beyond
+  sent data are rejected. Outstanding work shares one 45-second no-progress
+  budget across recovery attempts; blocked application writes have the same
+  budget, renewed on partial progress. Idle connections are unaffected.
+
+  Remove the extra exponential stall-rescue backoff and allow immediate AUTO
+  TCP handoff after a QUIC rescue race encounters lane-capacity refusals.
+  Suspected stalled lanes can be replaced without waiting for the young-lane
+  protection interval. Memory bounds and healthy racing-lane protection remain.
+
+  Stop and join the previous UDP relay reader before publishing its socket for
+  resumption, preventing it from consuming replies meant for the replacement.
+
+  Do not race a rescue JOIN against an unconfirmed optimistic OPEN. Remote
+  RESET and full-close cancellation bypass paused application delivery.
+- Keep ACK recovery progressing on reused, bidirectional connections. Replayed
+  DATA re-emits the cumulative ACK, new lanes receive the current ACK state,
+  and ACK writes prefer lanes that are not suspected stalled. Ordinary ACKs no
+  longer wait behind blocked application delivery. Already-delivered replay
+  ending exactly at the receive cursor no longer consumes the reassembly
+  window; segments crossing that cursor are rejected as overlaps.
+
+## v0.9.0 - 2026-10-17
+
+### Fixed
+
+- Acknowledged application messages no longer trigger lane rescue merely because
+  no response arrives within three round trips. The watchdog now requires
+  outstanding transport delivery, avoiding repeated recovery for slow origins,
+  one-way messages and quiet browser connections. Recovery races only QUIC
+  JOINs; an irreversible TCP handoff starts after the QUIC phase fails, so a
+  losing TCP attempt cannot retire the client's winning QUIC lane. Cancelling a
+  recovery attempt also interrupts its JOIN handshake instead of leaving it
+  blocked until the handshake timeout.
+  Delayed replay of already-delivered bytes after FIN is acknowledged instead
+  of aborting a completed response; data extending past FIN remains an error.
+
+### Security
+
+- Update the desktop, server, and mobile build toolchains to Go 1.26.9 and
+  upgrade golang.org/x/net to v0.60.0 with its companion dependencies to address
+  upstream security vulnerabilities.
+
+## v0.8.0 - 2026-09-19
+
+### Added
+
+- The Android app ships the full-device tunnel, and it is the default connection
+  mode for a new install. Until now a released build could only export a local
+  SOCKS5 endpoint for another VPN client, which left a phone with no such client
+  unable to connect at all. Both modes ship and are chosen under Settings; an
+  install that had already picked one keeps it. Because the release build now
+  declares a `VpnService`, a Google Play listing needs an Organization account
+  and Play's VPN declaration; direct APK distribution is unaffected.
+- The Android full tunnel routes the way the iOS tunnel does: a routing mode,
+  bypasses for local networks, the bundled Chinese address set and up to 256
+  hand-entered routes, and a rule-list editor with the same lint and the same
+  China preset, which keeps Chinese sites direct by name as well as by address.
+  Hand-entered routes are read as numeric addresses only, so a typo is refused
+  instead of being looked up. The address set installs as routes on Android 13
+  and later; earlier releases keep those addresses direct through a
+  `GEOIP,CN,DIRECT` rule. Routing is edited while disconnected and applies at
+  the next connect. While connected, the
+  home screen shows how many flows the rules sent through Queqiao, direct, or
+  rejected.
+
+### Changed
+
+- "Test all connections" on Android probes up to four profiles at once, as iOS
+  already did, and shows each result as it arrives; one slow or unreachable
+  provider no longer delays the verdict on the rest. Connection tests can also
+  be run while the tunnel is connected.
+
+## v0.7.0 - 2026-09-19
+
+### Added
+
+- The Android and iOS apps can read a one-time invitation from a QR code with
+  the device camera, from the same import screen that takes a pasted one. Five
+  hundred characters of base64 were never going to be typed from another
+  screen. Android decodes the frame on the device in the Go core and iOS uses
+  the system's own detector; no image or invitation leaves the process, and a
+  scanned code that is not a valid Queqiao invitation is refused at the
+  viewfinder. The released Android build gains only the CAMERA permission,
+  which is optional.
+- `queqiaod provider invite --qr` draws the new invitation as a QR code in the
+  terminal, black on a white field whatever the terminal theme, for the mobile
+  apps to scan. It goes to standard error, so standard output is still exactly
+  the URI and piping it into a portal keeps working.
+
+## v0.6.3 - 2026-09-07
+
+### Fixed
+
+- A gateway that stopped reading in the middle of a lane JOIN no longer wedges
+  that flow's lane admission slots for the flow's life: the OPEN_OK
+  acknowledgement is now written under a deadline, and a staged lane that
+  somehow stays stuck past the rescue-race window is evictable by the next
+  JOIN instead of counting against the ceiling forever. Permanent refusals --
+  a flow already committed to TCP fallback, a closed flow, a duplicate lane id
+  -- are now answered with the reset codes that mean so, rather than the
+  retryable lane-capacity answer the client would otherwise retry for the
+  flow's whole life. The client in turn stops believing a capacity answer that
+  repeats without a single successful rescue: after eight consecutive refusals
+  the flow fails fast so the application reconnects on a fresh session, after
+  three an AUTO flow commits to TCP fallback as its remaining escape, a peer
+  that says the flow already lives on TCP is taken at its word, and a TCP
+  bundle's widening pause after one capacity refusal now expires with the
+  recovery cooldown instead of lasting the flow's life.
+
+## v0.6.2 - 2026-09-05
+
+### Fixed
+
+- Lane rescue JOINs at the gateway are no longer blocked by the control/bulk
+  role restriction when a flow's lane ceiling is reached: eviction now picks
+  the oldest evictable lane, preferring one with the replacement's role but
+  never refusing a rescue for want of a same-role victim, so a dead control
+  lane can no longer wedge a flow's last admission slot. A JOIN lane whose
+  OPEN_OK could not be written is also removed from the flow at once instead
+  of leaking an admission slot that could never carry traffic. Lanes whose
+  handshake is in flight or younger than the rescue-race window remain
+  unevictable, since evicting them can kill the rescue attempt the client has
+  just crowned.
+
+## v0.6.1 - 2026-09-04
+
+### Fixed
+
+- A gateway endpoint written as a hostname is now resolved over a socket bound
+  the same way the lane will be. `--local-address` applies to the sockets the
+  client creates, but a dialer's `LocalAddr` and `Control` never reach the
+  lookup that turns the endpoint name into the address it connects to, so that
+  one question went out over an unbound socket. A host whose transparent proxy
+  redirects port 53 into this very client could then not answer it: the name
+  has to resolve before the datapath exists, and the datapath has to exist
+  before the name resolves, so both transports failed with `no such host` and
+  the provider never came up. Endpoints written as literal addresses were never
+  affected, and still take a path with no lookup in it.
+
+## v0.6.0 - 2026-09-03
+
+### Added
+
+- `queqiaod segments` profiles a live tunnel and says which segment the loss
+  is on, rather than only how much there is. A slow deployment has three
+  candidates that need three different responses — the client's own access
+  link, the long haul this transport carries, and the gateway's transit
+  onward — and until now every instrument here described the path end to
+  end, so an operator losing a seventh of what crossed the path learned only
+  that they were losing a seventh. The command measures both ends in the
+  same minutes and localises the fault by what the legs share: it reads the
+  running client's own per-direction erasure from `--metrics-listen`, which
+  is the only measurement that separates upstream from downstream, and with
+  `--ssh` it runs the same code on the gateway to measure that end's transit
+  directly instead of inferring it by subtraction. Anchors are chosen per
+  vantage point and never averaged, because a probe from a filtered network
+  to a filtered destination measures the filter: a Chinese and a global
+  anchor are probed from both ends, whichever answers cleanly establishes
+  that end's own link, and an address that answers echo while refusing a
+  handshake is reported as filtering rather than charged to anyone's link. A
+  leg that returns nothing is reported as unanswered, not as total loss.
+
+### Fixed
+
+- Flows stalled on one-way loss now recover in seconds instead of failing
+  after a minute. A lane used to be declared dead only on I/O error — fifteen
+  seconds of total receive silence — so on a path erasing the upstream
+  direction, downstream keepalives kept every connection nominally alive
+  while flows with a full send window made no progress at all. A per-flow
+  stall watchdog now measures forward progress where delivery to the peer is
+  actually recorded (the acknowledged send offset and payload arrival) and,
+  finding none for three minimum round trips while work is pending, demotes
+  the lane and starts a rescue beside it: the suspected lane keeps receiving
+  and is fully eligible again the moment an acknowledgement arrives on it.
+  The rescue dials up to three concurrent JOIN attempts sprayed uniformly
+  across the hop-port pool — or across independent handshakes on the single
+  port when hopping is off — and the first completed JOIN wins. The gateway
+  protects a freshly admitted lane from eviction at its lane ceiling, so the
+  losing JOINs of a parallel rescue can no longer retire the winner's server
+  side; such a late JOIN is refused by capacity instead, which the client
+  treats as one lost attempt rather than a lost session. A gateway that sees
+  a rescue JOIN arrive while a flow is waiting out its replacement grace now
+  restarts that grace instead of letting it expire mid-handshake, and
+  --handshake-timeout no longer overrides the client's safer 30-second
+  default with 10 seconds.
+- Port hopping actually hops now. The client and server port muxes implemented
+  quic-go's OOB socket interface, so quic-go bypassed them with recvmmsg on the
+  raw file descriptor: the server never read hop-port sockets at all, and the
+  client never rewrote reply addresses nor counted receives, which also made
+  the loss detector hop on phantom evidence. Both muxes now use the plain
+  packet path they can control. The client also walks the hop pool in a
+  shuffled order that persists across dials — previously every dial restarted
+  on the primary port and could hop only once before the dial timeout, so 98
+  of the 100 configured ports were never tried — and the detector waits for a
+  full measurement window before firing instead of hopping seconds after
+  connect.
+- A gateway with port hopping enabled no longer refuses to start because one
+  hop port is unavailable. The pool is derived from a hash over the provider
+  identity, so a derivation eventually lands on a port the host will not hand
+  out -- Windows carves dynamic exclusion ranges out of the same space and
+  refuses them with a permissions error, Linux has `ip_local_reserved_ports`,
+  and on any host another service may already hold one -- and binding the pool
+  was all-or-nothing, so a single such port took the whole listener down with
+  it. Ports that cannot be bound are now skipped and named in the listener's
+  log, leaving a narrower pool rather than no gateway. A pool that binds no
+  hop port at all is still an error, because hopping is then absent rather
+  than degraded, and an operator who asked for it should not have to infer
+  that from traffic which never evades anything.
+- Rescue races no longer misfire on the peer's lane ceiling. A capacity
+  refusal of the pooled control JOIN is a benign per-attempt outcome — usually
+  a sibling attempt already holds the lane — but it fell through to the
+  fallback paths: an ordinary QUIC join under `--transport quic`, or the AUTO
+  TCP commit, which could hand the flow to TCP while a QUIC sibling won the
+  race. Capacity refusals now end the attempt instead. The TCP fallback
+  metric also moved from commit time to install time, so a TCP commit that
+  loses its race no longer counts as a fallback, and the stall watchdog stays
+  silent while a rescue round is in flight rather than queueing another round
+  behind it.
+
+## v0.5.1 - 2026-09-02
+
+### Changed
+
+- When `--local-address if:NAME` or `--local-address auto` is used, the outer
+  UDP and TCP sockets now call `IP_BOUND_IF` (IPv4) and `IPV6_BOUND_IF` (IPv6)
+  in addition to binding to the resolved IP address. This sets the kernel
+  `INP_BOUND_IF` flag, which is what `NEAppProxyFlow.isBound` reflects in the
+  macOS Network Extension API.
+
+  The practical effect is that transparent proxy software on macOS that honours
+  `isBound` — including Tunless with its default `--capture-bound-flows=false`
+  setting — will now automatically bypass queqiaod's outer transport sockets
+  without any per-process exclusion rule. The outer connection to the upstream
+  gateway routes directly via the named interface as before; the only change is
+  that the intent is now declared at the OS socket level rather than implied by
+  the IP address alone.
+
+  A literal `--local-address 192.0.2.1` is unchanged: the interface is inferred
+  from routing, not declared, so `IP_BOUND_IF` is not set.
+
+### Fixed
+
+- The bundled China preset keeps Chinese services direct by name, not only by
+  address, and the registry set is refreshed to APNIC serial 88964. The address
+  set records where a block was delegated, which is not where it is used, so a
+  Chinese service answering from a CDN in space delegated elsewhere never
+  matched GEOIP,CN and took the tunnel while the toggle said direct: ip138.com
+  answers 138.113.x and bilibili.com 148.153.x, and a Chinese resolver returns
+  those same addresses, so nothing was being mis-resolved and no fresher list
+  could have helped. The preset now names the major Chinese services on TLDs
+  that a .cn rule cannot reach, together with the CDN and asset domains they
+  load from, and keeps GEOIP,CN last so the names are reached first. It is a
+  starting point rather than coverage: a geosite-derived list pasted into the
+  rule editor is still the way to be thorough. Refreshing the registry set moved
+  three blocks in ten days, which is the measure of how little staleness was
+  ever the problem.
+
+## v0.5.0 - 2026-08-28
+
+### Added
+
+- The Android debug build reads the same rule list as iOS, from
+  `routing-rules.conf` in its files directory, and carries the same packed
+  country set for `GEOIP` rules. It is a development affordance rather than a
+  shipped feature: the released Android app is not a VPN, declares no
+  `BIND_VPN_SERVICE`, and continues to hand routing to whichever consumer client
+  owns the device tunnel.
+- A new guide, [choosing and placing a gateway](docs/CHOOSING-A-GATEWAY.md),
+  covers the decision that precedes deployment and previously had no home in
+  the documentation. It states plainly that both ends run this software, so a
+  destination someone else operates needs a gateway on a host the reader
+  controls; it gives the placement rule that follows from the transport
+  improving the client-to-gateway segment and nothing past it; it works
+  through the anycast case, where a destination already served from an edge
+  near the caller is made slower by a gateway on another continent; and it
+  promotes the free client-side fixes out of the datacenter profile's
+  appendix, where they applied to every reader but only one audience could
+  find them.
+- `queqiaod doctor` now answers the question that decides a deployment before
+  it exists: whether this gateway is on the useful side of this client's path
+  to a destination it actually calls. Given `--destination host:port`, it
+  establishes connections to that destination directly and through the local
+  SOCKS listener, alternating the arms every round, and reports the two
+  distributions beside the verdict. The gateway round trip is now sampled
+  rather than dialled once, and is subtracted from the tunnelled
+  establishment to leave the gateway's own hop onward, which separates a
+  placement decision the operator can revisit from transit that relocating
+  the client will not change. Where the drift measured between arms is larger
+  than the difference between them, the check reports that the comparison did
+  not resolve anything rather than offering a conclusion, which is the
+  discipline `pathmeasure -mode ab` already follows and for the same reason.
+  This matters most for a destination published behind an anycast edge, where
+  the session already terminates near the caller and routing it through a
+  distant gateway adds the whole gateway leg for nothing while every other
+  check on the host still passes. The command continues to say nothing about
+  what the path does, because no local check can; `pathprobe` and
+  `pathmeasure` remain the instruments for that.
+- The iOS client routes by rule rather than only by address. A profile carries
+  a rule list in the `TYPE,VALUE,ACTION` syntax that Clash, mihomo, sing-box and
+  Shadowrocket all read, so an existing list can be pasted in: `DOMAIN`,
+  `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, `GEOIP` and `DST-PORT` choosing
+  between `PROXY`, `DIRECT` and `REJECT`, first match wins. A flow no rule
+  matches takes the tunnel, so a list that fails to load cannot put traffic on
+  the open path. The editor counts what loaded and names every line that did
+  not, by number, before you connect. There is one tunnel, so a rule naming a
+  proxy group is refused rather than quietly read as `PROXY`.
+- Name rules work on a packet tunnel, which needed the core to answer lookups
+  itself. A query is answered from `198.18.0.0/15`, the address becomes that
+  name's handle, and when the connection arrives the handle is reversed so the
+  rule list sees the name rather than an address. A proxied flow is then dialled
+  by name, so the gateway resolves it from the vantage the flow is being sent to
+  use; a `DIRECT` flow is resolved on the device, which is the vantage that
+  makes the answer right. This is what the bundled China set could not do on its
+  own: `docs/KNOWN-LIMITATIONS.md` recorded that a Chinese domain resolved
+  through the tunnel can answer with a CDN address outside the registry set and
+  take the tunnel anyway, and the bundled China preset now pairs `DOMAIN-SUFFIX`
+  rules with `GEOIP,CN` rather than relying on either alone.
+- The tunnel's metrics report what routing is doing: how many rules loaded, and
+  how many flows were proxied, sent direct, refused, decided by name, or refused
+  because they named a handle the resolver had forgotten. Zero rules with
+  traffic flowing is a different fault from a loaded list whose direct count
+  never moves, and an operator could not tell them apart without both numbers.
+
+### Changed
+
+- iOS routing is one setting, and all of it can be changed while the tunnel is
+  connected. Until now the traffic policy, the bundled China toggle, and the
+  typed bypass list were three controls answering one question, and they did not
+  agree about who was in charge: the bypass list and the country set applied
+  whatever the policy said, so a profile reading "All traffic" could be keeping
+  whole countries off the tunnel. There is now a routing mode, the bypass rules
+  underneath it, and the rule list this release adds, all carried in one value
+  the settings screen and the tunnel both compose through. Switching to global
+  routing leaves the rules stored rather than making someone dismantle a list to
+  turn the tunnel up. None of it needs a reconnect: the app saves the change and
+  asks the running provider to re-read it, and the provider reinstalls the
+  routes and hands the new rule list to the core without restarting the packet
+  engine. Flows already open keep the rules they started under, which is the
+  cost of not dropping the connection to edit them. A catalog written before the
+  merge migrates on load, and anything that was carving traffic out of the
+  tunnel comes back as a bypass rule rather than quietly rejoining it.
+
+### Fixed
+
+- The iOS packet-tunnel extension no longer runs itself into the memory ceiling
+  NetworkExtension enforces on it. The Go runtime soft limit was 40 MiB inside a
+  50 MiB whole-process cap, which left too little of that cap for everything the
+  Go heap does not cover: the resident text pages of the statically linked Go
+  and gVisor code, runtime metadata, goroutine and thread stacks, the Swift
+  packet bridge, and CoreFoundation. The collector spent whole minutes at
+  130-200% CPU defending a limit the process could not honour, and jetsam killed
+  the extension anyway, twelve to twenty-one minutes into a session. Because the
+  kill is a SIGKILL, the provider never ran `stopTunnel` and never recorded a
+  diagnostic, so the tunnel's network settings stayed installed and the VPN went
+  on showing connected while no packets moved — the failure a user sees is a
+  stall, with an empty connection log behind it. The limit is now 28 MiB, and
+  the test suite holds it far enough below the ceiling to leave that remainder
+  room.
+
+## v0.4.0 - 2026-08-26
+
+### Added
+
+- `pathmeasure -mode ab` compares two arms with the test order alternated and
+  the samples pooled. It prints the order effect next to the arm effect and
+  warns when the order effect is the larger of the two.
+- The path characterisation now records whether aggregating flows gives the
+  bandwidth estimator evidence a single bursty flow cannot, measured on the
+  lane carrying data rather than on the aggregate metrics endpoint, which
+  reports the idle pooled control connection. Sixteen concurrent flows raise
+  the estimate thirteenfold over one.
+- `--class-hint` declares the class a flow starts in from what produced it, as
+  a repeatable `<match>=<interactive|bulk>`. It is refused without `--flow-
+  metadata-socket`, since nothing would be there to ask, and a misspelled
+  class name fails at startup rather than matching nothing at runtime.
+- A concurrency measurement of the request tail against the TUIC-shaped
+  reference on an emulated datacenter path, plus named `pathsim` profiles for
+  the paths we've characterized.
+- A token stream beside a saturating transfer is now measured on the emulated
+  path, where the channel holds still. The same question could not be answered
+  on the live link: the stream degraded throughout the experiment whether or not
+  a transfer was running, so the arm measured last was the worst one and it was
+  the arm with no transfer in it.
+- A measured baseline of this transport against a datacenter workload on a
+  live China-US path, in both directions.
+- The datacenter profile's flow classification is validated on the live path.
+  Sixteen concurrent 300KB requests are demoted to bulk on the access-link
+  thresholds and none on the datacenter ones, which is what those thresholds
+  exist to change: a few hundred kilobytes is one ordinary request on a
+  datacenter leg and a transfer on an access link, and a demoted flow stops
+  preferring the coding that repairs a gap inside the round trip carrying it.
+- `docs/DEPLOYING-DC-PROFILE.md` covers running the datacenter profile: what
+  to measure before choosing it, the free tuning worth more than anything the
+  profile does, why voice belongs on UDP, how to configure class hints, and
+  what to watch afterwards.
+- `docs/DESIGN-DC-PROFILE.md` covers when the datacenter profile applies, what
+  differs from the access-link deployment, and the four design assumptions our
+  measurements overturned.
+- Three figures for the datacenter documents: where 1133ms of a speech request
+  goes, the two directions of the path behaving as different channels, and the
+  comparison that says to fix the client before deploying anything. Each is an
+  SVG with a real description, on a light ground so it reads in either GitHub
+  theme.
+- `docs/PATH-CHARACTER-DC-20260826.md` characterizes our first datacenter-to-
+  datacenter path, measuring each direction separately.
+- `docs/MEASURING-A-DC-PATH.md` is the runbook for re-running the datacenter
+  measurements, including the four traps that produced wrong answers the first
+  time.
+- `queqiaod doctor` reports whether a host is in the state the deployment
+  measurements assumed: the selected profile's qualification level and
+  precondition, the kernel settings that matter, and whether the gateway
+  answers. It exists because the setting worth the most is a kernel default
+  nothing else would mention: `tcp_slow_start_after_idle` is 1 on Linux, which
+  throws a connection's window away after any idle gap, and turning it off was
+  worth 4.5x on a 300KB burst.
+- `--flow-metadata-socket` lets the client ask a local capture agent what
+  produced each flow, so its class is known before it carries anything instead
+  of after the second the classifier needs to decide. A request that finishes
+  in 200ms spends its whole life inside that second. The profile maps what the
+  agent reports, usually an executable path, to a starting class; the
+  classifier still judges the flow by what it then does. Without the flag, and
+  without a matching hint, nothing changes.
+- A measurement of what fixes the frame workload's tail, comparing duplication
+  against doing nothing on an emulated lossy path.
+- A measurement of the streaming frame workload, many small messages at high
+  frequency, alongside the existing request measurement. The two stress
+  different mechanisms and give opposite answers on the same path.
+- The datacenter deployment guide records the capture path for applications
+  that cannot be reconfigured, measured end to end on the China-US path: an
+  unmodified application reaches 624.9ms cold on a 300KB request against
+  1089.3ms direct, and 381.2ms once warm, with the connect leg falling from
+  187.3ms to 0.2ms.
+- Destination groups can be tested for whether they really share a bottleneck,
+  by correlating short-window congestion signals, and merged when they do.
+- The datacenter profile can let the path tree's shape follow measured
+  evidence instead of the static hierarchy it starts from: destination groups
+  whose congestion arrives and leaves together are merged into one segment.
+  Ordinary reporting feeds the correlator, merges are applied at a bounded
+  cadence, and the access-link profile is unchanged. Merging is not undone
+  automatically, because the evidence that would justify splitting again is
+  gathered under the shared budget that hides the difference.
+- `pathmeasure -mode h2proxy` terminates HTTP/2 with large windows and streams
+  the body onward, which makes a small receive window irrelevant without
+  changing the receiver.
+- `pathmeasure` gains `h2serve` and `h2` modes, which measure what an HTTP/2
+  receive window costs on a long path by running the same upload against
+  servers that differ only in the window they advertise.
+- A path can be modeled as a chain of segments (uplink, then peer) instead of
+  a single endpoint pair, so flows to different places pool what they share
+  and keep separate what they don't. The `dc-long-haul` profile enables it;
+  the access-link profile is unchanged.
+- Two architecture figures for the datacenter design document, one per
+  installation: the application pointed at the proxy, and the application left
+  untouched with tunless catching the connection at the socket layer and
+  reporting what opened it.
+- `deploy/install-client.sh --path-profile` and `queqiaod service install
+  --path-profile` carry a path profile into the installed service. The flag
+  existed on `queqiaod client` and nothing between the installer and the unit
+  file carried it, so running the datacenter profile as a service meant editing
+  a definition the installer rewrites on every upgrade. An unknown name fails
+  the install rather than starting a service with policy nobody asked for.
+- `pathmeasure` gains `load` and `frames` modes for the two concurrent
+  workload shapes, and counts late messages against fixed thresholds rather
+  than each arm's own floor.
+- `--path-profile` selects which deployment a client or gateway is running in.
+  `wan-shared-bottleneck` is the default and behaves as before; `dc-long-haul`
+  is experimental and changes how flows are classified on a hop where every
+  flow is a latency-sensitive request.
+- `pathmeasure`, a companion to `pathprobe` that measures what a stack
+  achieves rather than what a path does. It reports flow completion time for
+  request-sized payloads, shows what a long-lived connection keeps between
+  bursts, measures both directions, runs concurrent request and frame
+  workloads, and reads the kernel's TCP_INFO to say which constraint was
+  binding.
+- The README now carries the second problem this transport turned out to solve:
+  inference deployed across regions, where a 355KB speech upload takes 1133ms of
+  which the model spends 38ms. It states the finding that argues against
+  deploying the transport alongside the one that argues for it, because that
+  finding changes what an operator should do first.
+- The datacenter path characterization now measures the real ASR and TTS
+  endpoints rather than synthetic transfers of the same size, and reports what a
+  tuned client recovers on its own so the profile's remaining value is stated
+  honestly: cold connections, unmodifiable callers, and the tail.
+- A measurement of one shared relay against several independent ones on a
+  datacenter path, where the answer is the opposite of the access-link result
+  that led us to retire multipath.
+- `pathmeasure -mode stream` measures a token stream, which none of the other
+  modes describes: it reports time to first token and how far behind the
+  generator's own schedule each token arrived, rather than a total the reader
+  never waits for in one piece. `-mode streamserve` emits tokens at a fixed
+  cadence so the generator is not a variable in the comparison.
+- The datacenter characterization now measures sustained throughput, which it
+  had never done: every other figure in it is a request latency. One flow
+  reaches 310.4 Mbit/s through the transport against 3.6 to 105.8 Mbit/s direct,
+  which is 93% of the path's own capacity knee, and it costs 75% of one core.
+- A figure for sustained throughput, which the datacenter characterization had
+  measured and never drawn: one flow reaching 310 Mbit/s against the path's own
+  333 Mbit/s knee, beside direct TCP's 3.6 to 105.8, with what a CPU profile
+  says the cost actually is.
+- The datacenter path characterization now separates what getting off TCP is
+  worth from what our coding adds, measured against the TUIC-shaped reference
+  on the same QUIC stack.
+- `pathmeasure -mode frames -udp-frames` measures the streaming frame workload
+  over UDP ASSOCIATE rather than a stream, which is how voice actually
+  travels. On a path erasing 3.6%, carrying frames over UDP through the tunnel
+  loses 34 of 3200 messages against 163 sent directly, and keeps the tail
+  flat; the same frames over TCP lose none and arrive with a p99 three and a
+  half times the median, because reliability turns each gap into delay for the
+  frames behind it.
+- `pathmeasure -mode workload` drives a real HTTP endpoint against two arms
+  rather than a transfer of the same size, splitting each request into connect,
+  request-to-first-byte, and download so that server-side compute does not bury
+  what the transport did. On a request shape where the leg containing the server
+  should match between arms, it checks that it does and says so.
+
+### Fixed
+
+- A class declared from flow attribution is counted as a class transition. It
+  was not, because a declared class never passes through the classifier's
+  observation path, so the whole mechanism was invisible in telemetry: an
+  operator reading `queqiao_class_transitions` saw zero and could not tell
+  hints that never fired from hints that were never configured.
+- The bandwidth estimator rescanned everything in flight on every congestion
+  event to drop retired packet states. At 300 Mbit/s over a 200ms round trip
+  that is about six thousand entries per acknowledgement, and a CPU profile of a
+  294 Mbit/s transfer attributed 13% of all time to that one loop. Packet
+  numbers only increase, so it now walks the range being dropped: 23x faster on
+  a benchmark retiring one window at a realistic acknowledgement cadence.
+- A transfer that stalled once anywhere inside its first `BulkBytes` was
+  permanently classified interactive on the datacenter profile, so it was coded
+  and held a single lane for the rest of its life. The idle veto now needs two
+  separate gaps: one is an event, two is a pattern, and only the pattern says a
+  flow is a caller rather than a transfer.
+- The ASR and TTS figures in the datacenter characterization were medians across
+  eight audio files of 146KB to 405KB, labelled with the size of whichever
+  request ran last. The mislabelling had a consequence rather than being
+  cosmetic: a tuned client was recorded at 225.8ms for what was called a 355KB
+  upload, which is below the floor that size has on a 200ms path with a 30ms
+  model. Re-measured with one fixed file, and the section is marked superseded
+  rather than deleted.
+- The pacer now meters only when there is evidence of congestion. It used to
+  meter every send at a bandwidth estimate that a request-shaped flow cannot
+  raise, because such a flow is application-limited by construction: one flow
+  estimated 42 Mbit/s where sixteen estimated 88 on the same path in the same
+  minutes. On the datacenter link that spent 67ms of a 355KB request protecting
+  a queue the controller's own delay signal said was not forming, and it was the
+  whole of this transport's deficit against a tuned TCP client.
+- The unmetered burst also requires the sending direction to be delivering
+  essentially everything. A policer holds no queue and its loss is sustained
+  enough that the estimator's floor rises to meet it, so both of the other
+  signals read clean on exactly the path where bursting is worst: gating on them
+  alone took an emulated policer from 3.0x overdrive to 4.0x and from 32.9% loss
+  to 54.9%.
+- The unmetered burst is what the path already holds rather than an addition to
+  it: what is in flight comes out of the allowance, and the bandwidth-delay
+  product it is measured against is the one the path delivers, not the larger
+  figure this sender puts on the wire to compensate erasure. A request-shaped
+  flow arrives with an empty pipe and is unaffected, which is the case the
+  burst exists for. A saturating flow is already holding that product, and
+  granting it another drove a burst into the bottleneck that the delay brake
+  then read as congestion: on the emulated erasure path the erasure controller
+  fell from 10.5 to 0.9 Mbit/s of a 14.5 Mbit/s capacity, and monotonically
+  worse the larger the burst.
+- Flow completion records now say whether a replacement lane was ever attempted,
+  not only whether one arrived: `lane_replacement_attempts` and
+  `lane_replacement_failures` join the fields already written by both endpoints.
+  On a live gateway, 84% of the flows that failed with "lane replacement
+  timeout" ended with no replacement lane admitted, and the record could not say
+  why. A client pool that will not rebuild opens nothing; a path that will not
+  carry a handshake opens dials that never complete. Those need different fixes,
+  and both leave `lanes_joined` unchanged, because a dial that fails never
+  reaches lane admission. The client's own failure log now also carries the
+  `flow_id` and attempt number, so the attempts behind a failed flow can be
+  found rather than inferred.
+- A long conversation no longer loses its forward error correction partway
+  through. Whether a flow is made of small exchanges was measured over its
+  whole life, so any session eventually carried more than the budget and was
+  demoted to bulk while still behaving exactly as it always had: a voice call
+  reached that point after about a minute and carried the rest of itself
+  uncoded, which is where the repair matters most, because a stream of small
+  messages never amortises a round trip over anything and every lost frame
+  pays one by itself. It is now measured over a recent window, which a
+  transfer never drops under and a conversation never reaches whatever its
+  age.
+- A block that sealed short because the producer stopped is now sized to a
+  delivery probability rather than to throughput. The throughput objective
+  prices a retransmission in symbols the flow could have sent instead, and a
+  flow that just stopped was not going to send them, so it declined the parity
+  and took the round trip. On a token stream over the China-US path that left
+  a 1.38% residual after coding, and every unrepaired symbol is a reader
+  watching a sentence stop.
+- The advice to set `net.ipv4.tcp_slow_start_after_idle=0` is now qualified by
+  direction, in the runbook, the design document and `queqiaod doctor`. It is
+  the most valuable line here on a direction that does not lose packets, and it
+  makes an erasing one worse: a 100KB synthesis download took 827.7ms on a cold
+  connection and 2281.2ms on a warm one with the sysctl set, because restoring
+  the window hands the controller more in flight for a multiplicative decrease
+  to take away.
+- Two UDP association tests no longer fail on Windows runners. They bound a
+  loopback port for TCP and then asked for the same number on UDP, which is
+  what a gateway offering QUIC beside a TCP fallback does, but the two
+  protocols have independent namespaces and an ephemeral TCP port can land
+  inside a range Windows has reserved for UDP. They now use the shared helper
+  that already solved this for the rest of the suite.
+
+## v0.3.1 - 2026-08-25
+
+### Fixed
+
+- The bandwidth sample shape is published rather than reading zero.
+  `queqiao_quic_sample_mean_bytes_per_second`, `..._max_bytes_per_second`,
+  `..._max_delivered_bytes` and `..._max_interval_seconds` were added in v0.3.0
+  to describe the delivery-rate samples the bandwidth estimate is built from.
+  The controller stored all four in atomics and the snapshot that carries
+  telemetry out of it never read them back, so every one of them left the
+  process as zero.
+
+  That is the failure mode v0.3.0 removed two other counters for: a figure that
+  cannot be produced reads as a measurement rather than as an absence, and
+  "the widest sample this connection ever took was nothing" is a claim these
+  metrics were making on every scrape. It was found by deploying v0.3.0 to the
+  gateway it was written for and reading the metric it added.
+
+  The four are the instrumentation for a question that a harness could not
+  settle -- an estimator driven against a simulated policer reports within one
+  per cent of the path while the same estimator in the full stack reported
+  twice it -- so publishing them as zero left that question exactly as open as
+  it was before they existed.
+
+## v0.3.0 - 2026-08-25
+
+### Added
+
+- The sender is now held back when the path is carrying more than one
+  bandwidth-delay product of queue. The bound is that the round trip may not
+  exceed twice the path's own minimum, which is the same rule as the
+  controller's 2.0 congestion-window gain expressed in the time domain, and it
+  is a ratio rather than a duration on purpose: a duration would have to be
+  chosen, and the choice would be a latency policy smuggled into a congestion
+  controller.
+
+  It matters because a deeply buffered bottleneck absorbs an overload instead
+  of dropping it, so there is no loss to respond to and delay is the only
+  evidence. It also catches something the window gain cannot: on an erasure
+  path the window is divided by the arrival rate so that a full one arrives,
+  which means what is sent can be several times the bottleneck's worth, and
+  the queue is downstream of that division. The bound is therefore applied
+  after the compensation rather than before it. queqiao_delay_brake_ratio
+  publishes how much of the rate the bound is currently removing, so a path
+  held back by its own queue can be told from one that simply measured less.
+- The path emulator can model a token bucket with a burst allowance, through
+  Config.PolicerBurstBytes. A shaped path has two rates rather than one: a
+  short probe drains the bucket and measures the line, while sustained load
+  measures the shaping rate, and a path emulated with only the second is
+  indistinguishable from a slower one. The existing shallow bucket, one refill
+  quantum plus a packet, still models the live path and remains the default.
+- The path emulator can change what it erases while traffic is crossing it, in
+  each direction independently, through Relay.SetLossRate and
+  Bottleneck.SetLossRate. A path that only ever erases what it was constructed
+  with cannot express the case a transport most needs to survive: a channel
+  that moves under a live flow, which is what the motivating incident was. A
+  negative rate leaves a direction alone so one can be changed without knowing
+  the other, and a change clears any correlated-loss burst state rather than
+  carrying the old regime across it.
+- The erasure a path is measured to be applying is now published, labelled by
+  the direction it was measured on: queqiao_erasure_ratio{direction="send"} in
+  the metrics and queqiao_erasure_ratio_send in the performance snapshot. A
+  gateway's send direction is its downstream, which is the direction that had
+  no metric at all. The only erasure figure that used to leave the process was
+  the congestion controller's floor, and a floor is not a smaller version of
+  the measurement: it is biased low so that pacing errs towards slowing down,
+  and it is a lower envelope for a connection's lifetime, so it keeps whatever
+  a clean window established while the channel moves. On one live incident the
+  two read 1.76% and 19.9%, and nothing on a dashboard could show which one
+  the code was being sized for.
+- The erasure an endpoint receives is now published as well as the erasure it
+  sends into. queqiao_coded_symbols_total is split by outcome -- arrived,
+  recovered by the code, or left the window still missing -- with
+  queqiao_erasure_ratio{direction="receive"} and
+  queqiao_erasure_residual_ratio{direction="receive"} derived from those
+  counters. The residual is what the code could not repair and the session re-
+  issues a round trip later, and it is the figure the motivating incident was
+  actually made of: 11% of the downstream payload, measured by the client's
+  decoders on every flow and never leaving the process. Because every source
+  symbol the peer sent ends in exactly one outcome, the three counters are a
+  denominator, so the ratios are counters over counters rather than a mean of
+  per-flow ratios that would weight a kilobyte flow the same as a gigabyte
+  one.
+- The delivery-rate samples behind the bandwidth estimate are now described in
+  the telemetry: their mean and their widest, and the interval and delivery
+  that produced the widest one. The estimate is a maximum over those samples,
+  and a maximum on its own cannot be read -- a rate is high either because the
+  path is fast or because the window it was measured over was short, and only
+  the interval and the delivery behind it tell those apart. A maximum far
+  above the mean is a tail rather than the path.
+
+  It is published because the question it answers could not be settled in a
+  harness. An estimator driven directly against a simulated policer reports
+  within one per cent of the path, while the same estimator in the full stack
+  reported twice it, and three explanations for that gap were measured and
+  ruled out before this existed. Deployed to a live gateway it answered the
+  question in one reading: the estimate stood at four times the widest sample
+  the connection had ever taken, which a maximum over samples cannot do, so
+  the fault was not in the sampling at all but in a second path that was
+  putting a number into the filter without it having been a sample. That is
+  the re-seeded peak fixed below.
+
+### Changed
+
+- Loss is no longer a congestion signal. The controller previously separated
+  erasure from congestion statistically and forwarded only the share the
+  channel could not explain, so that a path erasing packets independently of
+  the sending rate would not be read as an overloaded one. That separation is
+  gone: it was a statistical answer to a question the delivery-versus-rate
+  curve answers directly, and it was least reliable exactly when loss was
+  worst, because heavy erasure is bursty and the burst test then refused to
+  call it erasure at all. The brake is the delay bound instead.
+
+  Every loss now reaches the congestion controller, which matters for a reason
+  unrelated to congestion: its in-flight accounting is what was sent less what
+  was acknowledged and what was lost, so a controller told about only a
+  fraction of the losses believes the pipe is fuller than it is. The erasure
+  compensation rides on the measured erasure rather than on a floor biased low
+  for pacing, and waits for a measured round trip before engaging, because
+  that is when the delay bound can bound it.
+
+  queqiao_quic_controller_erasure_floor_ratio and
+  queqiao_quic_loss_suppressed_packets_total are removed. There is no floor
+  any more, and nothing is withheld from the controller, so neither figure can
+  be produced. queqiao_erasure_ratio{direction="send"} is the measurement that
+  replaced the first.
+
+### Fixed
+
+- The bandwidth estimate can now come down. Its max filter kept a sample for
+  ten packet-timed rounds, which is the right clock only while rounds advance
+  -- and a round advances when a packet sent in the previous round is
+  acknowledged, so a connection with nothing to send advances none. Measured
+  on a live gateway, 99.98% of samples were application limited and the round
+  counter moved about nine times an hour, turning a ten-round memory into
+  sixty-six minutes of wall time. One burst through a shaper therefore set the
+  estimate for the rest of the hour: the gateway held 519 Mbit/s against a
+  measured sustained 17.6 and paced and sized its congestion window from that.
+
+  A sample now expires on rounds or on wall time, whichever comes first, with
+  the wall-clock window derived from the measured minimum round trip rather
+  than configured -- ten rounds and the time ten rounds takes are the same
+  statement on a path whose rounds are advancing. An application-limited
+  sample may also replace a standing estimate once that estimate has expired,
+  which it previously could not; without that a connection which is
+  application limited essentially always would have expired its estimate with
+  nothing able to take its place.
+- A bandwidth estimate is no longer restored from a peak the filter would
+  already have expired. When the pipe empties, the sender re-seeds itself from
+  the best rate it has ever measured, so that a reused connection does not
+  repeat a discovery that is expensive on a lossy path. That peak only ever
+  rose, and the re-seed fires every time the pipe empties -- which on a
+  connection that is application limited essentially always is constantly --
+  so the estimate was re-armed faster than the filter could retire it.
+  Measured on a live gateway, the estimate stood at four times the widest
+  delivery sample the connection had ever taken, which a maximum over samples
+  cannot do. The peak now carries the time it was observed and is not put back
+  once a measurement of that age would have expired.
+
+  On an emulated policer this takes the overdrive from 7.3 times the path's
+  capacity to 2.4, and the loss from 49.8% to 36%. It costs about 15% on a 42%
+  erasure channel, which is the price of not pacing from data the filter has
+  already decided not to trust; the alternative bound was measured and costs
+  the same 15% while leaving the policer at 9.5 times.
+- Keep concurrent bulk isolation within its configured connection budget instead
+  of bypassing a full pool with dedicated QUIC dials.
+- Forward error correction is now sized for the erasure the path is measured to
+  be applying, and no longer for the congestion controller's floor. The floor is
+  biased low so that pacing errs towards slowing down, and the coded layer built
+  its whole view of the channel out of that one number, so on a path erasing
+  19.9% it sized parity for 1.76% and handed 11% of the payload back to the
+  session to re-issue a round trip later. Of the flows measured during the
+  incident that saw more than 5% erasure, every one ran a code sized for less
+  than half of it and 97% ran no code at all. The shared path model now carries
+  the measured erasure and its burstiness alongside the floor, and each consumer
+  reads the one whose error it can survive.
+
+  The code rate is also chosen differently. There is no residual target any
+  more -- a sender never observes the residual it chose, so it was an
+  unverifiable setpoint -- and no minimum coded loss below which parity was
+  refused. Both are replaced by choosing the rate that delivers a block soonest,
+  counting what an unrepairable block costs in round trips before its data
+  arrives, so a clean path buys no parity and a lossy one buys as much as it is
+  worth without either case needing a constant. A channel too lossy for any
+  allowed rate to repair a block more often than not is now reported as such
+  rather than being given a code that cannot work.
+- The erasure compensation now starts at none and earns each increase. It is a
+  bet that losses are independent of the sending rate, so that sending more
+  delivers proportionally more; on a path that drops because it is policed
+  rather than because it erases, the bet is wrong in a way that feeds itself,
+  because sending more is what raises the loss that then asks for more
+  compensation. Each step is now a tenth of the remaining distance, small
+  enough that the next round's delivery can be attributed to it, and is kept
+  only if the delivered rate actually improved. It makes no judgement about
+  the nature of the loss, only about whether sending harder delivered more.
+
+  Two things had to be right for that test to mean anything, and neither was.
+  The compensation accepted its first proposal whole, and by the time erasure
+  is first measured the sender has already burst and been policed, so that
+  proposal is for several times the rate with no evidence yet to test it
+  against. And it judged the bet against the sender's pacing rate, which the
+  compensation is itself an input to, so every increase appeared to have
+  worked. It now reads the delivered-rate estimate, and waits for a measured
+  round trip before engaging at all, so that the delay bound is in place to
+  bound it.
+
+  Measured against an emulated policer the overdrive falls from 42 times the
+  path's capacity to 7.3, and the loss from 72.5% to 49.8%. A 42% erasure
+  channel is unaffected, which is what says the compensation has not simply
+  been switched off. This bounds the loop without closing it: the bandwidth
+  estimate was a second and larger amplifier, fixed separately in this
+  release, and the known limitations record what is still left after both.
+- The metrics now report the loss the path actually caused.
+  `queqiao_quic_loss_observed_packets_total` counts every loss the sender
+  detected. Only the share charged to the congestion controller used to leave
+  the process, and on an erasure path that is a small fraction of what
+  happened: against a channel erasing a fifth of its packets the exported
+  figure read under two percent, because the rest had been reclassified as
+  erasure and then dropped from the record. Divide the observed count by
+  `queqiao_quic_packets_sent` for a loss rate. That reclassification is itself
+  gone in this release, so the two figures now agree; the observed counter is
+  what stays true if a controller ever again declines to count something.
+
+  `queqiao_quic_packets_lost` and `queqiao_quic_bytes_lost` are removed, along
+  with the visualizer's byte-loss series that was derived from them. They were
+  quic-go's own counters, which it increments only inside its cubic sender,
+  and this transport replaces the congestion controller -- so nothing could
+  ever move them off zero while the dashboard divided by them for its loss
+  chart. A counter that cannot be produced is worse than a missing one once it
+  is monotonic, because it then reads as a measurement rather than as an
+  absence.
+- Flow completion records now report what the flow's lane replacements did:
+  `lane_replacement_waits`, `lane_replacement_timeouts`, `lane_replacement_wait`
+  and `lanes_joined`, written by both the client and the gateway under the same
+  names. A flow that fails with "lane replacement timeout" previously recorded
+  only that it had given up, which was 94% of the failures observed on a live
+  gateway over two hours and could not be diagnosed after the fact: the record
+  did not say whether a replacement lane had ever been offered, how many graces
+  the flow burned before failing, or how long it spent with no lane at all.
+  Distinguishing a pool that will not rebuild from a path that will not carry a
+  handshake needs all four, and none of them could be recovered from the logs as
+  they stood.
+- A flow that loses its last lane now spends one replacement grace on the
+  outage, rather than one for each part of the flow that happens to be waiting
+  for the lane. Four call sites wait for a lane that is not there — the flow's
+  own run loop, the frame and control writers, and the acknowledgement loop —
+  and a lane that dies with writes in flight leaves more than one of them
+  waiting for the same absent replacement. Each started a fresh 45-second grace
+  of its own, so a flow that was never going to be rescued failed only after
+  some multiple of the grace that depended on which writers were blocked when
+  its lane died. A live gateway showed this as failures clustered at 76–106
+  seconds against a 45-second grace, for flows that had finished their work in
+  the first second and were then held open by the application. The grace is
+  unchanged; what changed is that it is now the whole of what a flow waits, and
+  a flow that really is given a replacement lane is owed a full grace again for
+  any later outage.
+- Recover UDP associations after a pooled QUIC stream stops making progress, and
+  replace connections bound to a DHCP address which disappeared after a network
+  change. An observed interface outage also starts a new path when the address
+  after reconnect is unchanged, instead of leaving any of these paths stalled
+  until the client restarts.
+- Fixed a data race between the flow telemetry goroutine and the congestion
+  controller's packet goroutine. The delay brake was recomputed each time
+  telemetry was collected, so that a trace taken while nothing was sending
+  would report a fresh figure rather than the last one, and recomputing it
+  read the inner sender's minimum round trip -- which the packet goroutine
+  writes. Every other value telemetry reports comes from an atomic for exactly
+  this reason. It is now read rather than recomputed, which costs a stale
+  figure on an idle connection and is the right trade against an
+  unsynchronised read of the controller's state.
 
 ## v0.2.0 - 2026-08-23
 
@@ -110,6 +977,22 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
 ### Fixed
 
+- The gateway reports how stale its authorization state is. A failed refresh
+  leaves the previous snapshot in force, which is correct - a briefly
+  unreadable file must not disarm a running gateway - but it was also silent:
+  the refresh runs once a second and wrote 86,400 identical error lines a day,
+  none of which said when the run started, how long it had been going, or how
+  old the rules still being enforced were, and no metric covered any of it. The
+  store now records when its snapshot was last read from disk, the run is
+  reported at its edges - always on the first failure, restated at most once a
+  minute with the run length and the age of the snapshot in force, and always
+  on recovery - and four series are exported:
+  `queqiao_authorization_refresh_failures_total`,
+  `queqiao_authorization_reloads_total`,
+  `queqiao_authorization_consecutive_refresh_failures`, and
+  `queqiao_authorization_last_good_timestamp_seconds`. This is the fault that
+  keeps every existing device working while refusing every new enrollment, so
+  nothing else in the flow counters moves when it happens.
 - The deployment guide's worked example created an account with a flow ceiling
   of 8, which is too low to load a web page.
 - Enrollment refusals say which of the two possible things went wrong, and say

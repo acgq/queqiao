@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -17,8 +18,10 @@ import (
 	"github.com/bojieli/queqiao/internal/coded"
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/netbind"
 	"github.com/bojieli/queqiao/internal/pathmodel"
+	"github.com/bojieli/queqiao/internal/portmux"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -74,6 +77,19 @@ type congestionConfig struct {
 	brutalBytesPerSecond   uint64
 	adaptiveMinBytesPerSec uint64
 	adaptiveMaxBytesPerSec uint64
+	// hierarchicalPath models the path as a chain of segments rather than a
+	// single endpoint pair, so that flows to different peers pool what they
+	// share -- the uplink -- while keeping separate what they do not.
+	//
+	// It is off by default because the deployment this project's published
+	// results describe has one peer, where the two models are identical by
+	// construction and the extra node measures nothing. It earns its keep when
+	// one client serves several providers, which share the client's uplink and
+	// nothing else.
+	hierarchicalPath bool
+	// discoverGrouping lets the tree's shape follow the evidence rather than
+	// the static hierarchy. It does nothing without hierarchicalPath.
+	discoverGrouping bool
 }
 
 type udpHealth struct {
@@ -82,6 +98,19 @@ type udpHealth struct {
 	threshold int
 	cooldown  time.Duration
 	blockedTo time.Time
+}
+
+// hopDialConfig carries port-hopping configuration for dialQUICConnection.
+// A zero value disables port hopping.
+type hopDialConfig struct {
+	portCount  int    // 0 or 1 = disabled; ≥2 = enabled
+	providerID string // for deterministic HopPorts derivation
+	// walk is the client-wide port selection state, shared by all dials so
+	// each attempt continues where the previous one left off instead of
+	// restarting on the primary port.
+	walk    *portmux.HopWalk
+	metrics *metrics.Registry
+	logger  *slog.Logger
 }
 
 // quicPathEvidence is deliberately narrower than "a QUIC operation ended".
@@ -238,11 +267,15 @@ type quicBidiStream interface {
 // connection counters.  Keeping the QUIC type out of the flow and metrics
 // packages lets TCP rescue lanes remain dependency-independent.
 type laneTransportStats struct {
-	latestRTT, smoothedRTT       time.Duration
-	bytesSent, bytesReceived     uint64
-	packetsSent, packetsReceived uint64
-	bytesLost, packetsLost       uint64
-	controller                   wancongestion.ControllerTelemetry
+	latestRTT, smoothedRTT   time.Duration
+	bytesSent, bytesReceived uint64
+	// Coded receive-direction symbol outcomes. Every source symbol the peer
+	// sent ends in exactly one of the three, which is what makes them a
+	// denominator: arrived, reconstructed by the code, or left the window
+	// still missing and re-issued by the session a round trip later.
+	codedSources, codedRecovered, codedLost uint64
+	packetsSent, packetsReceived            uint64
+	controller                              wancongestion.ControllerTelemetry
 }
 
 type laneStatsProvider interface {
@@ -317,10 +350,18 @@ func (c *quicStreamConn) transportStats() laneTransportStats {
 		latestRTT: s.LatestRTT, smoothedRTT: s.SmoothedRTT,
 		bytesSent: s.BytesSent, bytesReceived: s.BytesReceived,
 		packetsSent: s.PacketsSent, packetsReceived: s.PacketsReceived,
-		bytesLost: s.BytesLost, packetsLost: s.PacketsLost,
 	}
 	if c.controller != nil {
 		stats.controller = c.controller.Telemetry()
+	}
+	if c.bulk != nil {
+		// The coded path belongs to the connection, not the stream, so these
+		// are connection-scoped like the counters above and fold once however
+		// many lanes share it.
+		coded := c.bulk.Stats()
+		stats.codedSources = coded.Sources
+		stats.codedRecovered = coded.Recovered
+		stats.codedLost = coded.Lost
 	}
 	return stats
 }
@@ -373,20 +414,36 @@ func tlsClientConfig(credentials identity.ClientCredentials) (*tls.Config, error
 
 func dialTCP(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error) (streamConn, error) {
 	var localAddr net.Addr
+	composed := control
+	// LocalAddr and Control apply to the connection this dialer makes, never to
+	// the lookup that turns the endpoint name into the address it connects to.
+	// An endpoint named rather than numbered therefore asked its question over
+	// an unbound socket, which capture is free to claim and send to the very
+	// gateway the answer is needed to reach. Built from the resolution the
+	// binding already needed, so a dial does not enumerate interfaces twice.
+	resolver := net.DefaultResolver
 	if localAddress != "" {
-		ip, err := resolveLocalAddress(localAddress)
+		result, err := netbind.ResolveWithInterface(localAddress)
 		if err != nil {
 			return nil, err
 		}
-		localAddr = &net.TCPAddr{IP: ip.AsSlice()}
+		localAddr = &net.TCPAddr{IP: result.Addr.AsSlice()}
+		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
+		resolver = netbind.ResolverForResult(result, control)
 	}
 	tlsConfig, err := tlsClientConfig(credentials)
 	if err != nil {
 		return nil, err
 	}
 	conn, err := (&tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second, LocalAddr: localAddr, Control: control},
-		Config:    tlsConfig,
+		NetDialer: &net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+			LocalAddr: localAddr,
+			Control:   composed,
+			Resolver:  resolver,
+		},
+		Config: tlsConfig,
 	}).DialContext(ctx, "tcp", remote)
 	if err != nil {
 		return nil, explainDataHandshakeError(remote, "TCP", err)
@@ -528,7 +585,13 @@ func quicConfig(windows flowWindows) *quic.Config {
 		// Existing-flow TCP rescue cannot begin until QUIC declares the
 		// black-holed lane dead. Keep this bound well below application-level
 		// request timeouts while allowing several PTOs on a 200 ms WAN.
-		MaxIdleTimeout:                 15 * time.Second,
+		//
+		// laneReplacementWait is derived from this, because a flow's grace has
+		// to cover the time its peer spends reaching this same conclusion
+		// before it can even begin opening a replacement. Changing the number
+		// here changes what a flow waits; it is not a knob local to one
+		// connection.
+		MaxIdleTimeout:                 laneDeadPathDetection,
 		KeepAlivePeriod:                5 * time.Second,
 		InitialStreamReceiveWindow:     streamWindow,
 		MaxStreamReceiveWindow:         streamMax,
@@ -549,8 +612,8 @@ func quicConfig(windows flowWindows) *quic.Config {
 	}
 }
 
-func dialQUIC(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows) (streamConn, error) {
-	conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, dialTimeout, localAddress, control, observeTransientWrite, windows)
+func dialQUIC(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows, hop hopDialConfig) (streamConn, error) {
+	conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, dialTimeout, localAddress, control, observeTransientWrite, windows, hop)
 	if err != nil {
 		return nil, err
 	}
@@ -583,9 +646,12 @@ func dialQUIC(ctx context.Context, remote string, credentials identity.ClientCre
 // after the route returns. The negotiated idle timeout remains the finite
 // bound for a path that does not return.
 //
-// The wrapper deliberately recognizes only local availability and buffer
-// errors. Permission, descriptor, message-size and peer/protocol errors still
-// reach quic-go and close the unusable transport.
+// The wrapper deliberately recognizes only errors a socket can outlive.
+// EADDRNOTAVAIL / WSAEADDRNOTAVAIL reaches quic-go: a socket explicitly bound
+// to a DHCP address which disappeared cannot migrate to its replacement, and
+// pretending its writes succeeded leaves every stream on it stalled until a
+// process restart. Permission, descriptor, message-size and peer/protocol
+// errors likewise close the unusable transport.
 type transientRoutePacketConn struct {
 	net.PacketConn
 	observe func(error)
@@ -671,7 +737,13 @@ func transientRouteWriteError(err error) bool {
 // dialQUICConnection establishes only the QUIC connection. Keeping this
 // separate from stream creation allows the client to pool one connection and
 // open a stream for each logical flow without paying another handshake.
-func dialQUICConnection(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows) (*quic.Conn, net.PacketConn, error) {
+//
+// When hop.portCount ≥ 2, the raw UDP socket is wrapped in a ClientPortMux
+// before being handed to quic-go, and a HopController goroutine is started to
+// monitor for the per-port blocking pattern caused by GFW and trigger port
+// hops reactively. The mux's context is cancelled when the PacketConn is
+// closed, which stops the goroutine.
+func dialQUICConnection(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
 	dialCtx := ctx
 	var cancel context.CancelFunc
 	if dialTimeout > 0 {
@@ -683,20 +755,52 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 		return nil, nil, err
 	}
 	listenAddress := ":0"
+	composed := control
+	// See dialTCP: the lookup that turns a named endpoint into an address does
+	// not inherit the socket's binding, so it needs a resolver that carries it.
+	resolver := net.DefaultResolver
 	if localAddress != "" {
-		ip, parseErr := resolveLocalAddress(localAddress)
+		result, parseErr := netbind.ResolveWithInterface(localAddress)
 		if parseErr != nil {
 			return nil, nil, parseErr
 		}
-		listenAddress = net.JoinHostPort(ip.String(), "0")
+		listenAddress = net.JoinHostPort(result.Addr.String(), "0")
+		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
+		resolver = netbind.ResolverForResult(result, control)
 	}
-	remoteAddr, err := net.ResolveUDPAddr("udp", remote)
+	remoteAddr, err := resolveUDPAddr(dialCtx, remote, resolver)
 	if err != nil {
 		return nil, nil, err
 	}
-	packetConn, err := (&net.ListenConfig{Control: control}).ListenPacket(dialCtx, "udp", listenAddress)
+	packetConn, err := (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, "udp", listenAddress)
 	if err != nil {
 		return nil, nil, err
+	}
+	if hop.portCount >= 2 {
+		// Wrap the raw UDP socket with bidirectional port rewriting. The mux
+		// is transparent to quic-go: outgoing packets are redirected to the
+		// active hop port and incoming packets appear to originate from the
+		// primary port.
+		rawUDP := packetConn.(*net.UDPConn)
+		ports := portmux.HopPorts(hop.providerID, remoteAddr.Port, hop.portCount)
+		mux := portmux.NewClientPortMux(rawUDP, remoteAddr, ports)
+		if hop.walk != nil {
+			// Start the dial on the next walked port rather than the
+			// primary: the primary is the port a blocker watches, and
+			// restarting there every dial strands the pool's other ports.
+			idx := hop.walk.Next()
+			from, to := mux.Hop(idx)
+			if hop.logger != nil {
+				hop.logger.Debug("QUIC dial starting on walked hop port", "from_port", from, "to_port", to)
+			}
+		}
+		ctrl := portmux.NewHopController(mux, portmux.HopConfig{
+			Walk:    hop.walk,
+			Metrics: hop.metrics,
+			Logger:  hop.logger,
+		})
+		go ctrl.Run(mux.Context())
+		packetConn = mux
 	}
 	packetConn = tolerateTransientRouteErrors(packetConn, observeTransientWrite)
 	conn, err := quic.Dial(dialCtx, packetConn, remoteAddr, tlsCfg, quicConfig(windows))
@@ -717,19 +821,54 @@ func explainDataHandshakeError(remote, transport string, err error) error {
 // validateLocalAddressSpec checks syntax without requiring the address or
 // interface to be present at process startup. DHCP and interface state can
 // change after startup; resolution is therefore repeated for every outer
-// dial by resolveLocalAddress.
+// dial by netbind.ResolveWithInterface.
 func validateLocalAddressSpec(spec string) error {
 	return netbind.Validate(spec)
 }
 
-// resolveLocalAddress supports a literal IP, `if:NAME`, or `auto`. Interface
-// and automatic modes deliberately consider only IPv4 addresses on active,
-// non-loopback, non-point-to-point interfaces: the fixed deployment endpoint
-// is IPv4, and excluding point-to-point links prevents selecting the Clash
-// TUN itself. Ambiguity is an error rather than silently routing the optimizer
-// through an unintended NIC.
-func resolveLocalAddress(spec string) (netip.Addr, error) {
-	return netbind.Resolve(spec)
+// resolveUDPAddr resolves a UDP endpoint through the given resolver.
+//
+// net.ResolveUDPAddr would use the default one, whose sockets carry neither the
+// local address nor the interface binding the lane is about to use. A literal
+// address needs no lookup and takes the same path it always did.
+func resolveUDPAddr(ctx context.Context, remote string, resolver *net.Resolver) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(remote)
+	if err != nil {
+		return nil, err
+	}
+	if addr, parseErr := netip.ParseAddr(host); parseErr == nil {
+		return net.ResolveUDPAddr("udp", net.JoinHostPort(addr.String(), port))
+	}
+	portNumber, err := net.LookupPort("udp", port)
+	if err != nil {
+		return nil, err
+	}
+	addresses, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("no addresses for %q", host)
+	}
+	return &net.UDPAddr{IP: addresses[0].IP, Zone: addresses[0].Zone, Port: portNumber}, nil
+}
+
+// composeSocketControls returns a control function that calls a then b. Either
+// may be nil; if both are nil the result is nil. The first non-nil error aborts
+// the chain.
+func composeSocketControls(a, b func(string, string, syscall.RawConn) error) func(string, string, syscall.RawConn) error {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return func(network, address string, conn syscall.RawConn) error {
+		if err := a(network, address, conn); err != nil {
+			return err
+		}
+		return b(network, address, conn)
+	}
 }
 
 func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestion.TelemetryProvider {
@@ -757,7 +896,7 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		// overshot by however many lanes there were. Live, four lanes
 		// delivered about 8 Mbit/s where one delivered 11.
 		controller := wancongestion.NewErasureSenderOn(
-			conn.InitialPacketSize(), pathmodel.Shared(peerKey(conn)))
+			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
 		conn.SetCongestionControl(controller)
 		return controller
 	case CongestionBrutal:
@@ -789,6 +928,36 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 // downstream is sized from it. The local address is what distinguishes them:
 // changing uplink changes it, so the model for the new path starts empty
 // rather than inheriting the old one's conclusions.
+// pathModelFor returns the model this connection contributes to and reads.
+//
+// Flat, that is one model per endpoint pair, which is what every deployment
+// had before the tree existed and what the WAN results were measured on.
+// Hierarchical, it is the uplink's model and the peer's, and a flow may do
+// only what the tighter of the two permits -- so a second provider reached
+// over the same uplink starts from what the first measured about it, and a
+// congested peer does not throttle traffic to a healthy one.
+func pathModelFor(conn *quic.Conn, hierarchical, discover bool) pathmodel.Model {
+	key := peerKey(conn)
+	if !hierarchical {
+		return pathmodel.Shared(key)
+	}
+	k := pathmodel.Key{Egress: egressOf(conn), Dest: key}
+	if discover {
+		return pathmodel.SharedChainRegrouping(k)
+	}
+	return pathmodel.SharedChain(k)
+}
+
+// egressOf names the local side of the connection, which is the segment every
+// flow from this host shares regardless of where it is going.
+func egressOf(conn *quic.Conn) string {
+	source := addressHost(conn.LocalAddr())
+	if isUnspecifiedHost(source) {
+		source = routeSource(conn.RemoteAddr())
+	}
+	return source
+}
+
 func peerKey(conn *quic.Conn) string {
 	return pathKey(conn.LocalAddr(), conn.RemoteAddr())
 }

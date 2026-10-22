@@ -48,6 +48,18 @@ type Config struct {
 	// heavy reverse loss collapses, and the forward flow stalls even though its
 	// own direction is healthy.
 	UpstreamLossRate float64
+	// UpstreamClean states that the client-to-server direction erases nothing,
+	// which UpstreamLossRate cannot express because its zero means "inherit
+	// LossRate".
+	//
+	// The distinction is not hypothetical. The China-US datacenter path
+	// measured in docs/PATH-CHARACTER-DC-20260826.md erases 14% downstream and
+	// 0.0% upstream -- zero of 41,663 datagrams at 50 Mbit/s -- and that
+	// asymmetry is its defining feature. An emulator that can only say
+	// "different and non-zero" cannot reproduce the case where a transport's
+	// acknowledgements cross a clean channel while its data does not, which is
+	// exactly when a coding decision is easiest to get wrong.
+	UpstreamClean bool
 	// LossBurstPackets is the mean length, in packets, of a loss burst. One
 	// (or zero) gives independent Bernoulli loss. Larger values switch to a
 	// Gilbert model: the path alternates between a lossless good state and a
@@ -121,6 +133,17 @@ type Config struct {
 	// so a model that under-reports it would certify a code rate that fails on
 	// the real path.
 	PolicerRefillPeriod time.Duration
+	// PolicerBurstBytes is the token bucket's depth: how much a sender may put
+	// through after an idle period before the shaping rate shows through.
+	// Zero keeps the shallow bucket that models the live path, one refill
+	// quantum plus a packet.
+	//
+	// A deep bucket is what makes a shaped path something other than a slower
+	// one. A short probe drains the bucket and measures the line rate, while
+	// sustained load measures the shaping rate, so the path has two rates and
+	// no single bandwidth -- which is the case a max filter reports wrongly by
+	// construction, and the reason a bandwidth estimate has to be able to fall.
+	PolicerBurstBytes int
 	// Seed makes the loss pattern reproducible across runs.
 	Seed int64
 	// MTU bounds a single datagram. Zero selects 1500.
@@ -334,9 +357,14 @@ func (d *direction) policeLocked(now time.Time, size int, cfg Config) bool {
 	// passed two packets per period instead of two and a half, which measured
 	// as 19 Mbit/s out of a 25 Mbit/s limiter.
 	bucket := quantum + float64(cfg.MTU)
+	if burst := float64(cfg.PolicerBurstBytes); burst > bucket {
+		bucket = burst
+	}
 	if d.tokenAt.IsZero() {
 		d.tokenAt = now
-		d.tokens = quantum
+		// A bucket a sender has not touched yet is full, which is what gives
+		// the first burst its allowance.
+		d.tokens = bucket
 	}
 	// Bounded because an idle path can leave an arbitrary gap since the last
 	// packet, and the bucket saturates after two refills anyway.
@@ -438,7 +466,9 @@ func NewBottleneck(cfg Config) *Bottleneck {
 	b.up.rng = rand.New(rand.NewSource(cfg.Seed))
 	b.down.rng = rand.New(rand.NewSource(cfg.Seed + 1))
 	b.up.lossRate = cfg.LossRate
-	if cfg.UpstreamLossRate > 0 {
+	if cfg.UpstreamClean {
+		b.up.lossRate = 0
+	} else if cfg.UpstreamLossRate > 0 {
 		b.up.lossRate = cfg.UpstreamLossRate
 	}
 	b.down.lossRate = cfg.LossRate
@@ -499,7 +529,9 @@ func newRelay(listen, target string, cfg Config, shared *Bottleneck) (*Relay, er
 		r.upstream.rng = rand.New(rand.NewSource(cfg.Seed))
 		r.downstream.rng = rand.New(rand.NewSource(cfg.Seed + 1))
 		r.upstream.lossRate = cfg.LossRate
-		if cfg.UpstreamLossRate > 0 {
+		if cfg.UpstreamClean {
+			r.upstream.lossRate = 0
+		} else if cfg.UpstreamLossRate > 0 {
 			r.upstream.lossRate = cfg.UpstreamLossRate
 		}
 		r.downstream.lossRate = cfg.LossRate
@@ -511,6 +543,49 @@ func newRelay(listen, target string, cfg Config, shared *Bottleneck) (*Relay, er
 
 // LocalAddr is the address clients should use in place of the real server.
 func (r *Relay) LocalAddr() string { return r.local.LocalAddr().String() }
+
+// SetLossRate changes what the path erases, in each direction, while traffic
+// is already crossing it.
+//
+// A path that only ever erases what it was constructed with cannot express the
+// case a transport most needs to survive: one whose channel changes under a
+// live flow. The motivating incident was exactly that -- downstream erasure
+// moving from a few percent to sixty over a working afternoon -- and a
+// controller that reads a floor established during the clean window will size
+// its code for a channel that no longer exists. Emulating the step is the only
+// way to test that the estimate follows.
+//
+// A negative rate leaves that direction alone, so a caller may change one
+// without knowing the other.
+func (r *Relay) SetLossRate(upstream, downstream float64) {
+	r.upstream.setLossRate(upstream)
+	r.downstream.setLossRate(downstream)
+}
+
+// SetLossRate changes what a shared bottleneck erases, for every relay
+// attached to it.
+func (b *Bottleneck) SetLossRate(upstream, downstream float64) {
+	b.up.setLossRate(upstream)
+	b.down.setLossRate(downstream)
+}
+
+// setLossRate takes the same lock the drop decision is made under, so a change
+// lands between packets rather than during one.
+func (d *direction) setLossRate(rate float64) {
+	if rate < 0 {
+		return
+	}
+	if rate > 1 {
+		rate = 1
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.lossRate = rate
+	// A Gilbert chain mid-burst would otherwise carry the old regime's bad
+	// state across the change and erase everything until it happened to
+	// recover, which reads as the new rate arriving late.
+	d.inBurst = false
+}
 
 // Stats returns the upstream (client to server) and downstream counters.
 func (r *Relay) Stats() (up, down Stats) { return r.upstream.stats(), r.downstream.stats() }

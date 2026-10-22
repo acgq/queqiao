@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status:** Current operational guide for public protocol 1
-> **Last reviewed:** 2026-08-23
+> **Last reviewed:** 2026-08-21
 
 This guide takes you from an empty host to a working paired deployment: a
 provider gateway, one-time user enrollment, a desktop SOCKS client, and
@@ -22,6 +22,13 @@ archive covers.
 For a quick overview, start with the [repository README](../README.md). Use
 [known limitations](KNOWN-LIMITATIONS.md) to check whether the paired-gateway
 assumption fits your network before exposing a service.
+
+This guide assumes the placement decision has already been made. If it has not
+-- if the gateway host is not chosen yet, or the destinations are operated by
+someone else -- read [choosing and placing a
+gateway](CHOOSING-A-GATEWAY.md) first. A gateway on the wrong side of the
+traffic's real bottleneck lengthens the path while everything below still
+verifies correctly.
 
 ## Install with the scripts
 
@@ -209,52 +216,6 @@ Private, loopback, link-local, multicast, and unspecified destinations are
 blocked after DNS resolution. Add `--allow-private-destinations` only when the
 service is intentionally an access proxy into a private network.
 
-### Route gateway traffic through sing-box
-
-The gateway can hand all accepted destination traffic to a SOCKS5 upstream on
-the same host, leaving sing-box to choose a direct or proxied final outbound.
-Configure a sing-box SOCKS inbound on loopback with both TCP and UDP enabled,
-then add this server option:
-
-```sh
-queqiaod server \
-  --state /var/lib/queqiao/provider \
-  --listen :443 \
-  --outbound-socks5 127.0.0.1:1080
-```
-
-For the packaged systemd unit, append the same option to `QUEQIAOD_ARGS` and
-restart the service. The setting affects only application destination traffic
-leaving the gateway. Queqiao carrier, enrollment, renewal, and metrics sockets
-do not pass through it.
-
-The upstream is deliberately restricted to a literal loopback address and
-uses SOCKS5 without authentication: the unencrypted protocol is treated as a
-local process boundary, not a remote proxy transport. When it is configured,
-failure of the upstream fails the destination open; Queqiao does not silently
-bypass routing policy by falling back to a direct connection.
-
-TCP uses SOCKS5 CONNECT. Each Queqiao UDP association uses SOCKS5 UDP
-ASSOCIATE, and its TCP control connection is retained together with the UDP
-relay during Queqiao lane recovery. The sing-box inbound must therefore
-support UDP; a TCP-only inbound makes UDP association opens fail closed.
-
-Queqiao resolves and validates the requested destination at the gateway before
-contacting the upstream. If every current answer passes the destination policy,
-the SOCKS5 request retains the original domain so sing-box domain rules can
-select an outbound. The trusted upstream then performs the final resolution.
-This makes the local sing-box configuration and its DNS path part of the
-destination-policy boundary: do not let an untrusted user control them, and do
-not point this option at a remote SOCKS server. A later or divergent upstream
-DNS answer cannot be compared with Queqiao's earlier validation.
-`--allow-private-destinations` still controls the initial validation and should
-be enabled only for an intentional private-access service.
-
-Verify TCP and UDP separately. An IP check through the client proves the final
-TCP egress; a DNS query through SOCKS5 UDP proves that sing-box's UDP inbound
-and selected outbound both work. Check the sing-box log as well as Queqiao's
-`remote flow opened` and UDP metrics before relying on the route.
-
 ## Add users and issue invitations
 
 Create a separate account for every customer or administrative boundary:
@@ -315,12 +276,17 @@ authenticated private channel:
 sudo -u queqiao /usr/local/bin/queqiaod provider invite \
   --state /var/lib/queqiao/provider \
   --user alice \
-  --expires-in 1h
+  --expires-in 1h \
+  --qr
 ```
 
 The URI is a temporary bearer credential. The provider stores only its token
-digest, and the lifetime cannot exceed seven days. A portal may capture the
-stdout value or render it as a QR code without translating any fields.
+digest, and the lifetime cannot exceed seven days. With `--qr` the command
+also draws the invitation as a QR code, which the Android and iOS apps scan
+from their import screens; the code goes to standard error so standard output
+stays the bare URI and is still safe to pipe. A portal may capture that value
+or render it as a QR code without translating any fields. Do not render it
+through a web QR generator, which would receive the credential.
 
 Audit or revoke unused invitations without printing their tokens:
 

@@ -70,15 +70,18 @@ func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(n
 		}
 		t.Cleanup(func() { _ = relay.Close() })
 		remote = relay.LocalAddr()
+		lastRelay = relay
 	}
 
 	clientListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	clientMetrics := metrics.New()
+	lastClientMetrics = clientMetrics
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: roots, Transport: TransportQUIC,
-		EnableQUICPool: pooled, Logger: logger, Metrics: metrics.New(),
+		EnableQUICPool: pooled, Logger: logger, Metrics: clientMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -94,6 +97,14 @@ func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(n
 // lastClient is the client the most recent harness built, for tests that need
 // to call into it rather than through its SOCKS port.
 var lastClient *Client
+
+// lastClientMetrics is that client's registry, for tests that need to say why
+// a flow behaved as it did rather than only that it did.
+var lastClientMetrics *metrics.Registry
+
+// lastRelay is the emulated path the most recent harness built, for tests that
+// change what it does while a flow is crossing it.
+var lastRelay *pathsim.Relay
 
 // clientServerAcross brings up a client and server across a path and returns
 // the client, for tests that drive it directly rather than through SOCKS.
@@ -374,4 +385,194 @@ func erasureChannelBudget(budget time.Duration) time.Duration {
 		return 4 * budget
 	}
 	return budget
+}
+
+// Falsification case 2 from the control redesign, end to end: the channel gets
+// materially worse under a live flow and the code has to follow it.
+//
+// This is the incident's own shape. Downstream erasure went from a few percent
+// to sixty over an afternoon, and the code stayed sized for the clean window
+// because the controller's floor was a lower envelope for the lifetime of the
+// connection and the coded layer built its whole view of the channel out of
+// that one scalar. Every unit test for the fix supplies the measurement
+// directly; this one makes the stack measure it.
+func TestTheCodeFollowsAChannelThatGetsWorseMidFlow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up QUIC across an emulated 300 ms path")
+	}
+	requireStableImpairmentClock(t)
+	path := pathsim.Config{
+		OneWayDelay:         150 * time.Millisecond,
+		RateBytesPerSec:     uint64(25e6 / 8),
+		PolicerRefillPeriod: 8 * time.Millisecond,
+		LossRate:            0.02,
+		Seed:                23,
+	}
+	socks, destination := codedPair(t, true, &path)
+	relay := lastRelay
+	if relay == nil {
+		t.Fatal("the harness did not expose the emulated path")
+	}
+	conn := socksDial(t, socks, destination, erasureChannelBudget(180*time.Second))
+	defer conn.Close()
+
+	payload := make([]byte, 16*1024)
+	rand.New(rand.NewSource(9)).Read(payload)
+	echo := func(what string) {
+		t.Helper()
+		go func() { _, _ = conn.Write(payload) }()
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("%s: the flow was corrupted", what)
+		}
+	}
+
+	// Enough traffic on the clean channel for the model to settle on it.
+	for i := 0; i < 3; i++ {
+		echo("clean channel")
+	}
+	cleanErasure := measuredErasure(t)
+	t.Logf("clean channel: measured erasure %.4f", cleanErasure)
+
+	// Now the channel gets much worse, without the flow being told.
+	relay.SetLossRate(-1, 0.45)
+	for i := 0; i < 6; i++ {
+		echo("degraded channel")
+	}
+	degradedErasure, degradedFloor := measuredErasureAndFloor(t)
+	t.Logf("degraded channel: measured erasure %.4f, controller floor %.4f",
+		degradedErasure, degradedFloor)
+
+	// The flow surviving is necessary but not the point: what the incident
+	// showed is a code that stayed sized for a channel that no longer existed.
+	// The measurement the code reads has to have followed the path.
+	if degradedErasure <= cleanErasure {
+		t.Fatalf("the channel went from 2%% to 45%% downstream erasure and the measurement "+
+			"the code is sized from went %.4f to %.4f", cleanErasure, degradedErasure)
+	}
+	if degradedErasure < 0.05 {
+		t.Fatalf("a 45%% erasure channel is being reported to the code as %.4f", degradedErasure)
+	}
+	// The floor is logged for contrast rather than asserted on. It is a lower
+	// envelope for the lifetime of the connection, so it keeps what the clean
+	// window established while the measurement moves -- on this path it
+	// typically reads around a seventh of the erasure, which is the same shape
+	// as the live incident's 1.76% against 19.9%. Sizing parity from it is
+	// sizing for a channel that no longer exists. But a later change that made
+	// the floor track honestly would be an improvement, and this test must not
+	// fail for it: what is under contract here is that the measurement follows.
+	t.Logf("the floor the code used to be sized from reads %.4f against a measured %.4f",
+		degradedFloor, degradedErasure)
+
+	// And the damage the erasure actually does has to be visible from outside
+	// the process. The client receives the degraded direction, so its decoders
+	// are what measured it; during the live incident that figure existed only
+	// in per-flow records and the 11% residual it showed had no metric at all.
+	snapshot := lastClient.Metrics().Snapshot()
+	symbols := snapshot.QUICCodedSources + snapshot.QUICCodedRecovered + snapshot.QUICCodedLost
+	t.Logf("client decoders: %d symbols, receive erasure %.4f, residual %.4f",
+		symbols, snapshot.ReceiveErasure(), snapshot.ReceiveResidual())
+	if symbols == 0 {
+		t.Fatal("no coded symbols reached the metrics, so the receive direction is still invisible")
+	}
+	if snapshot.ReceiveErasure() <= 0 {
+		t.Fatalf("the client received a degraded channel and reports %.4f receive erasure",
+			snapshot.ReceiveErasure())
+	}
+}
+
+// measuredErasure is the largest erasure any live endpoint pair in this process
+// has measured on the direction it sends into, which is what fec.Choose is
+// sized from.
+func measuredErasure(t *testing.T) float64 {
+	t.Helper()
+	erasure, _ := measuredErasureAndFloor(t)
+	return erasure
+}
+
+// measuredErasureAndFloor reports the measurement the code is sized from
+// alongside the controller's floor, which is what it used to be sized from.
+func measuredErasureAndFloor(t *testing.T) (erasure, floor float64) {
+	t.Helper()
+	for _, model := range pathmodel.Live() {
+		if state := model.Current(); state.Erasure > erasure {
+			erasure = state.Erasure
+		}
+	}
+	return erasure, 0
+}
+
+// The delay bound, against a real queue rather than a supplied round trip.
+//
+// A deeply buffered bottleneck is the case a loss-based controller cannot see
+// at all: the queue absorbs the overload instead of dropping it, so there is no
+// loss signal and the only evidence is the delay. The bound is that the round
+// trip may not exceed twice the path's own minimum, which is one
+// bandwidth-delay product of queue.
+func TestABulkTransferIsHeldBackByADeepQueue(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up QUIC across an emulated 300 ms path")
+	}
+	requireStableImpairmentClock(t)
+	path := pathsim.Config{
+		OneWayDelay:     150 * time.Millisecond,
+		RateBytesPerSec: 250_000,
+		// A bandwidth-delay product here is 75 KB. Ten times that is a router
+		// with far more buffer than it needs, which is the ordinary case and
+		// the one that produces delay instead of loss.
+		QueueBytes: 750_000,
+		Seed:       41,
+	}
+	socks, destination := codedPair(t, false, &path)
+	conn := socksDial(t, socks, destination, erasureChannelBudget(180*time.Second))
+	defer conn.Close()
+
+	// Enough bulk to fill the buffer and keep it full.
+	payload := make([]byte, 512*1024)
+	rand.New(rand.NewSource(17)).Read(payload)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 3; i++ {
+			if _, err := conn.Write(payload); err != nil {
+				return
+			}
+		}
+	}()
+	got := make([]byte, len(payload)*3)
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("bulk across a deeply buffered path: %v", err)
+	}
+	<-done
+
+	s := lastClient.Metrics().Snapshot()
+	minRTT, smoothed := s.QUICControllerMinRTT, s.QUICSmoothedRTT
+	t.Logf("min_rtt=%v smoothed=%v queue=%v brake=%.4f",
+		minRTT.Round(time.Millisecond), smoothed.Round(time.Millisecond),
+		(smoothed - minRTT).Round(time.Millisecond), s.QUICDelayBrake)
+
+	if minRTT <= 0 {
+		t.Fatal("the path was never measured, so there was no bound to apply")
+	}
+	// The contract: past one round trip of queue the brake must be engaged.
+	// Below it the bound is silent by design, and a run that never filled the
+	// buffer has nothing to say -- but it must not be silent above it.
+	queue := smoothed - minRTT
+	if queue <= minRTT {
+		t.Skipf("the buffer never filled past the bound (queue %v against a %v minimum), "+
+			"so this run cannot test the brake", queue, minRTT)
+	}
+	if s.QUICDelayBrake == 0 {
+		t.Fatalf("the path is carrying %v of queue against a %v minimum and the brake reads "+
+			"zero, so nothing is holding the sender back", queue, minRTT)
+	}
+	// And the brake has to match the overshoot rather than being a flag.
+	want := 1 - float64(minRTT)/float64(queue)
+	if s.QUICDelayBrake < want*0.5 || s.QUICDelayBrake > want*1.5+0.05 {
+		t.Fatalf("brake reads %.4f against an overshoot implying about %.4f",
+			s.QUICDelayBrake, want)
+	}
 }

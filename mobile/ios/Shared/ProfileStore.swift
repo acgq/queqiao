@@ -51,7 +51,7 @@ struct ProfileStore: Sendable {
             secretAccount: account,
             displayName: summary.name,
             summary: summary,
-            trafficPolicy: .allTraffic,
+            routingMode: .allTraffic,
             importedAt: ISO8601DateFormatter().string(from: Date())
         )
         try keychain.set(profileJSON, account: account)
@@ -104,32 +104,32 @@ struct ProfileStore: Sendable {
         try save(catalog)
     }
 
-    func setTrafficPolicy(_ policy: TrafficPolicy, for id: String) throws {
-        var catalog = try catalog()
-        guard let index = catalog.profiles.firstIndex(where: { $0.id == id }) else {
-            throw ProfileStoreError.profileNotFound
-        }
-        catalog.profiles[index].trafficPolicy = policy
-        try save(catalog)
-    }
-
-    /// Stores bypass routes for one profile. The entries are sanitized by
+    /// Writes the whole routing configuration at once, for the same reason
+    /// `setOnDemandPolicy` does: the mode and the rules are read together when
+    /// the plan is built, and three setters would let the catalog hold a state
+    /// no screen ever asked for between saves. Route entries are sanitized by
     /// save, so the caller may pass raw text split into candidates.
-    func setBypassRoutes(_ routes: [String], for id: String) throws {
+    func setRouting(_ routing: RoutingConfiguration, for id: String) throws {
         var catalog = try catalog()
         guard let index = catalog.profiles.firstIndex(where: { $0.id == id }) else {
             throw ProfileStoreError.profileNotFound
         }
-        catalog.profiles[index].bypassRoutes = routes
+        catalog.profiles[index].routing = routing
         try save(catalog)
     }
 
-    func setBypassChinaDirect(_ enabled: Bool, for id: String) throws {
+    /// Stores the rule list as text, exactly as the user wrote it.
+    ///
+    /// It is not parsed or reordered on the way in. The core is what acts on
+    /// these rules and what reports on them, and a store that quietly rewrote
+    /// the text would hand the user back something they did not type while the
+    /// tunnel ran something else again.
+    func setRoutingRules(_ rules: String, for id: String) throws {
         var catalog = try catalog()
         guard let index = catalog.profiles.firstIndex(where: { $0.id == id }) else {
             throw ProfileStoreError.profileNotFound
         }
-        catalog.profiles[index].bypassChinaDirect = enabled
+        catalog.profiles[index].routingRules = rules
         try save(catalog)
     }
 
@@ -237,7 +237,7 @@ struct ProfileStore: Sendable {
             secretAccount: account,
             displayName: summary.name,
             summary: summary,
-            trafficPolicy: .allTraffic,
+            routingMode: .allTraffic,
             importedAt: ISO8601DateFormatter().string(from: Date())
         )
         try keychain.set(legacy, account: account)

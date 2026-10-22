@@ -9,7 +9,6 @@ import (
 
 	quiccongestion "github.com/apernet/quic-go/congestion"
 
-	"github.com/bojieli/queqiao/internal/lossmodel"
 	"github.com/bojieli/queqiao/internal/pathmodel"
 )
 
@@ -19,17 +18,6 @@ func losses(n int) []quiccongestion.LostPacketInfo {
 		out[i] = quiccongestion.LostPacketInfo{PacketNumber: quiccongestion.PacketNumber(i), BytesLost: 1200}
 	}
 	return out
-}
-
-// Until the channel has been measured, every loss is congestion as far as this
-// controller knows, and it must behave exactly like the BBR it wraps. Guessing
-// early is how a clean path would be driven into collapse.
-func TestUnmeasuredLossIsTreatedAsCongestion(t *testing.T) {
-	e := NewErasureSender(1200)
-	got := e.congestive(lossmodel.Snapshot{}, losses(10))
-	if len(got) != 10 {
-		t.Fatalf("forwarded %d of 10 losses before the channel was measured", len(got))
-	}
 }
 
 func TestExplicitCongestionOutcomesDoNotInferAmbiguousPacketGaps(t *testing.T) {
@@ -79,228 +67,74 @@ func TestClusteredStartupLossDoesNotBecomeAnErasureFloor(t *testing.T) {
 	}
 }
 
-// Gating the floor on evidence must not turn the erasure controller into plain
-// BBR. Once enough independent losses have been observed, compensation should
-// still converge on the channel's actual arrival rate.
-func TestIndependentLossBecomesAnErasureFloor(t *testing.T) {
+// Compensation is a bet that sending more delivers more, and it is now taken
+// one step at a time with each step tested against the delivered rate.
+//
+// Where the bet pays -- a channel that erases independently of the sending
+// rate -- it must still get there, or pacing a delivered-rate estimate makes
+// the sending rate its own input and the loop walks down to nothing.
+func TestCompensationGrowsWhileItBuysDelivery(t *testing.T) {
 	e := NewErasureSender(1200)
-	rng := rand.New(rand.NewSource(1))
-	var acked []quiccongestion.AckedPacketInfo
-	var lost []quiccongestion.LostPacketInfo
-	for pn := 0; pn < 5000; pn++ {
-		if rng.Float64() >= 0.42 {
-			acked = append(acked, quiccongestion.AckedPacketInfo{
-				PacketNumber: quiccongestion.PacketNumber(pn), BytesAcked: 1200,
-			})
-		} else {
-			lost = append(lost, quiccongestion.LostPacketInfo{
-				PacketNumber: quiccongestion.PacketNumber(pn), BytesLost: 1200,
-			})
+	e.inner.minRTT = 200 * time.Millisecond
+	e.SetRTTStatsProvider(&fixedRTT{min: 200 * time.Millisecond, smoothed: 200 * time.Millisecond})
+
+	// Delivery improves every round, which is what compensating for genuine
+	// erasure looks like.
+	delivered := uint64(100_000)
+	for round := uint64(1); round <= 12; round++ {
+		e.inner.round = round
+		delivered += 20_000
+		e.inner.estimator.maxFilter.updateMax(round, monotime.Now(), delivered)
+		e.compensationFor(0.58)
+	}
+	if got := e.appliedArrival; got > 0.62 || got < 0.55 {
+		t.Fatalf("applied arrival %.3f after twelve rounds of improving delivery, want about 0.58", got)
+	}
+}
+
+// Where the bet does not pay -- a policer, which drops because of the sending
+// rate rather than independently of it -- compensation must stay where it is.
+// Sending harder there raises the loss that asks for more compensation, which
+// is a loop that ends at many times the path's capacity.
+func TestCompensationHoldsWhenItBuysNothing(t *testing.T) {
+	e := NewErasureSender(1200)
+	e.inner.minRTT = 200 * time.Millisecond
+	e.SetRTTStatsProvider(&fixedRTT{min: 200 * time.Millisecond, smoothed: 200 * time.Millisecond})
+
+	// Delivery is flat however hard the sender is asked to try.
+	e.inner.estimator.maxFilter.updateMax(1, monotime.Now(), 250_000)
+	for round := uint64(1); round <= 12; round++ {
+		e.inner.round = round
+		e.compensationFor(0.28)
+	}
+	if got := e.appliedArrival; got < 0.85 {
+		t.Fatalf("applied arrival fell to %.3f on a path whose delivery never improved; "+
+			"that is the policer feedback loop", got)
+	}
+}
+
+// Before a round trip has been measured the brake cannot act, so compensation
+// must not either. The sender is then plain BBR that ignores loss.
+func TestCompensationWaitsForTheBrake(t *testing.T) {
+	e := NewErasureSender(1200)
+	rng := rand.New(rand.NewSource(3))
+	number := quiccongestion.PacketNumber(0)
+	for round := 0; round < 20; round++ {
+		var acked []quiccongestion.AckedPacketInfo
+		var lost []quiccongestion.LostPacketInfo
+		for i := 0; i < 500; i++ {
+			if rng.Float64() < 0.42 {
+				lost = append(lost, quiccongestion.LostPacketInfo{PacketNumber: number, BytesLost: 1200})
+			} else {
+				acked = append(acked, quiccongestion.AckedPacketInfo{PacketNumber: number, BytesAcked: 1200})
+			}
+			number++
 		}
+		e.OnCongestionEventEx(0, monotime.Now(), acked, lost)
 	}
-	e.OnCongestionEventEx(0, monotime.Now(), acked, lost)
-
-	if got := e.arrivalRate(); got < 0.54 || got > 0.62 {
-		t.Fatalf("independent 42%% loss produced arrival rate %.3f, want about 0.58", got)
-	}
-}
-
-// A real erasure channel needs a conservative bootstrap before the formal
-// memoryless verdict has enough transitions. Otherwise BBR backs away from the
-// channel first and a short transfer spends most of its life recovering.
-func TestIndependentLossBootstrapsBeforeTheMemorylessVerdict(t *testing.T) {
-	e := NewErasureSender(1200)
-	rng := rand.New(rand.NewSource(2))
-	var acked []quiccongestion.AckedPacketInfo
-	var lost []quiccongestion.LostPacketInfo
-	for pn := 0; pn < 180; pn++ {
-		if rng.Float64() >= 0.42 {
-			acked = append(acked, quiccongestion.AckedPacketInfo{
-				PacketNumber: quiccongestion.PacketNumber(pn), BytesAcked: 1200,
-			})
-		} else {
-			lost = append(lost, quiccongestion.LostPacketInfo{
-				PacketNumber: quiccongestion.PacketNumber(pn), BytesLost: 1200,
-			})
-		}
-	}
-	e.OnCongestionEventEx(0, monotime.Now(), acked, lost)
-
-	if snapshot := e.estimator.Snapshot(); snapshot.Memoryless {
-		t.Fatalf("test already reached the formal memoryless verdict: %+v", snapshot)
-	}
-	if got := e.arrivalRate(); got >= 0.9 || got < 0.5 {
-		t.Fatalf("early independent loss produced arrival rate %.3f, want conservative compensation", got)
-	}
-}
-
-func TestPartiallyClusteredLossDoesNotBootstrapCompensation(t *testing.T) {
-	snapshot := lossmodel.Snapshot{
-		Decided:          1000,
-		Samples:          1000,
-		Loss:             0.90,
-		LossAfterArrival: 0.70,
-		Floor:            0.88,
-	}
-	if floor, _ := conservativeErasureFloor(snapshot); floor != 0 {
-		t.Fatalf("partially clustered loss produced erasure floor %.3f", floor)
-	}
-}
-
-func TestExtremeLossRequiresTheFormalVerdict(t *testing.T) {
-	snapshot := lossmodel.Snapshot{
-		Decided:          1000,
-		Samples:          1000,
-		Loss:             0.85,
-		LossAfterArrival: 0.84,
-		BurstFactor:      1,
-		Floor:            0.85,
-	}
-	if floor, _ := conservativeErasureFloor(snapshot); floor != 0 {
-		t.Fatalf("unconfirmed extreme loss produced erasure floor %.3f", floor)
-	}
-	snapshot.Memoryless = true
-	if floor, _ := conservativeErasureFloor(snapshot); floor != 0 {
-		t.Fatalf("short formal verdict produced extreme floor %.3f", floor)
-	}
-	snapshot.Decided = 2 * lossmodel.DefaultRoundSamples
-	if floor, _ := conservativeErasureFloor(snapshot); floor != snapshot.Floor {
-		t.Fatalf("formal verdict produced floor %.3f, want %.3f", floor, snapshot.Floor)
-	}
-}
-
-func TestAnEstablishedEarlyFloorSurvivesLaterClustering(t *testing.T) {
-	e := NewErasureSender(1200)
-	early := lossmodel.Snapshot{
-		Decided:          120,
-		Samples:          120,
-		Loss:             0.42,
-		LossAfterArrival: 0.41,
-		Floor:            0.38,
-	}
-	if floor, _ := e.establishedErasureFloor(early); floor != early.LossAfterArrival {
-		t.Fatalf("early independent floor = %.3f, want %.3f", floor, early.LossAfterArrival)
-	}
-
-	clustered := lossmodel.Snapshot{
-		Decided:          1000,
-		Samples:          1000,
-		Loss:             0.75,
-		LossAfterArrival: 0.40,
-		Floor:            0.60,
-	}
-	if floor, _ := e.establishedErasureFloor(clustered); floor != early.LossAfterArrival {
-		t.Fatalf("later clustering moved established floor to %.3f, want %.3f", floor, early.LossAfterArrival)
-	}
-
-	completed := clustered
-	completed.Decided = lossmodel.DefaultRoundSamples
-	completed.Floor = 0.41
-	if floor, _ := e.establishedErasureFloor(completed); floor != completed.Floor {
-		t.Fatalf("completed-round floor = %.3f, want %.3f", floor, completed.Floor)
-	}
-}
-
-// A saturated path can keep every round congested long enough for the
-// estimator's entire minimum window to rise. That observation is not a new
-// physical erasure floor: compensating for it would add parity and pacing
-// pressure to the queue that caused it.
-func TestCompletedCongestedRoundsCannotRaiseAnEstablishedFloor(t *testing.T) {
-	e := NewErasureSender(1200)
-	established := lossmodel.Snapshot{
-		Decided:          200,
-		Samples:          200,
-		Loss:             0.42,
-		LossAfterArrival: 0.42,
-		BurstFactor:      1,
-		Floor:            0.42,
-	}
-	if floor, _ := e.establishedErasureFloor(established); floor != 0.42 {
-		t.Fatalf("established floor = %.3f, want 0.420", floor)
-	}
-
-	overloaded := lossmodel.Snapshot{
-		Decided:          10 * lossmodel.DefaultRoundSamples,
-		Samples:          4 * lossmodel.DefaultRoundSamples,
-		Loss:             0.72,
-		LossAfterArrival: 0.50,
-		BurstFactor:      1.4,
-		Floor:            0.66,
-	}
-	if floor, _ := e.establishedErasureFloor(overloaded); floor != 0.42 {
-		t.Fatalf("congested rounds raised established floor to %.3f, want 0.420", floor)
-	}
-}
-
-func TestIndependentEvidenceCanLowerAnEstablishedFloor(t *testing.T) {
-	e := NewErasureSender(1200)
-	first := lossmodel.Snapshot{
-		Decided:          200,
-		Samples:          200,
-		Loss:             0.42,
-		LossAfterArrival: 0.42,
-		BurstFactor:      1,
-		Floor:            0.42,
-	}
-	e.establishedErasureFloor(first)
-
-	cleaner := lossmodel.Snapshot{
-		Decided:          2 * lossmodel.DefaultRoundSamples,
-		Samples:          lossmodel.DefaultRoundSamples,
-		Loss:             0.30,
-		LossAfterArrival: 0.30,
-		BurstFactor:      1,
-		Floor:            0.30,
-		Memoryless:       true,
-	}
-	if floor, _ := e.establishedErasureFloor(cleaner); floor != 0.30 {
-		t.Fatalf("lower independent floor = %.3f, want 0.300", floor)
-	}
-}
-
-// A channel whose loss is entirely its floor is not congested at any rate, and
-// forwarding those losses is what costs the path: BBR-TUIC delivers 1.56
-// Mbit/s where the same path carries 13.89.
-func TestChannelLossIsNotForwarded(t *testing.T) {
-	e := NewErasureSender(1200)
-	snapshot := lossmodel.Snapshot{Decided: 5000, Floor: 0.42, Recent: 0.42}
-	var forwarded int
-	for i := 0; i < 100; i++ {
-		forwarded += len(e.congestive(snapshot, losses(10)))
-	}
-	if forwarded != 0 {
-		t.Fatalf("forwarded %d losses on a channel whose loss is all floor", forwarded)
-	}
-}
-
-// Loss above the floor is the sender's own, and it must reach BBR or the
-// controller has no congestion response at all.
-func TestLossAboveTheFloorIsForwarded(t *testing.T) {
-	e := NewErasureSender(1200)
-	// Two thirds of this loss is above the floor.
-	snapshot := lossmodel.Snapshot{Decided: 5000, Floor: 0.24, Recent: 0.72}
-	var forwarded int
-	for i := 0; i < 100; i++ {
-		forwarded += len(e.congestive(snapshot, losses(10)))
-	}
-	if want := 1000 * 2 / 3; forwarded < want*9/10 || forwarded > want*11/10 {
-		t.Fatalf("forwarded %d of 1000 losses, want about %d", forwarded, want)
-	}
-}
-
-// A congestive share below a half must still be reported. Rounding it away
-// would blind the controller to exactly the mild persistent congestion it most
-// needs to see, so the fractional part is carried rather than dropped.
-func TestASmallCongestiveShareIsNotRoundedAway(t *testing.T) {
-	e := NewErasureSender(1200)
-	// A tenth of the loss is congestive, and losses arrive one at a time.
-	snapshot := lossmodel.Snapshot{Decided: 5000, Floor: 0.45, Recent: 0.5}
-	var forwarded int
-	for i := 0; i < 1000; i++ {
-		forwarded += len(e.congestive(snapshot, losses(1)))
-	}
-	if forwarded < 80 || forwarded > 120 {
-		t.Fatalf("forwarded %d of 1000 single losses at a tenth congestive, want about 100", forwarded)
+	if got := e.arrivalRate(); got < 0.99 {
+		t.Fatalf("compensated at %.3f with no measured round trip, so nothing could have "+
+			"bounded it", got)
 	}
 }
 
@@ -368,8 +202,8 @@ func TestTheCongestionWindowIsCompensated(t *testing.T) {
 func TestAJoiningSenderStartsFromWhatIsAlreadyKnown(t *testing.T) {
 	model := pathmodel.NewPathModel()
 	const perMember = 2e6
-	model.Report(1, 0.42, 5000, 5000, perMember, 0)
-	model.Report(2, 0.42, 5000, 5000, perMember, 0)
+	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perMember, RoundTrip: 0})
+	model.Report(2, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perMember, RoundTrip: 0})
 
 	seeded := NewErasureSenderOn(1200, model)
 	if seeded.Share() <= 0 {
@@ -379,42 +213,6 @@ func TestAJoiningSenderStartsFromWhatIsAlreadyKnown(t *testing.T) {
 	if seeded.bandwidth() <= fresh.bandwidth() {
 		t.Fatalf("seeded sender starts at %d, no better than an unseeded %d",
 			seeded.bandwidth(), fresh.bandwidth())
-	}
-}
-
-func TestAJoiningSenderUsesButDoesNotClaimTheInheritedFloor(t *testing.T) {
-	model := pathmodel.NewPathModel()
-	model.Report(1, 0.42, 5000, 5000, 2e6, 250*time.Millisecond)
-
-	seeded := NewErasureSenderOn(1200, model)
-	if seeded.floorTrusted || seeded.establishedFloor != 0 {
-		t.Fatalf("joining sender claimed trusted=%t local floor=%.3f before measuring",
-			seeded.floorTrusted, seeded.establishedFloor)
-	}
-	if got := seeded.arrivalRate(); got < 0.579 || got > 0.581 {
-		t.Fatalf("joining sender arrival rate = %.3f, want 0.580", got)
-	}
-
-	// Its first local sample is intentionally too small to establish a floor;
-	// zero weight leaves the shared model's retained value intact.
-	floor, samples := seeded.establishedErasureFloor(lossmodel.Snapshot{Decided: 12, Samples: 12})
-	if floor != 0 || samples != 0 {
-		t.Fatalf("first replacement report = floor %.3f samples %.0f, want no local verdict", floor, samples)
-	}
-	if got := model.Report(seeded.id(), floor, samples, 12, 0, 0).Floor; got != 0.42 {
-		t.Fatalf("untrusted replacement report erased retained floor: %.3f", got)
-	}
-
-	// A new connection is the measurement generation boundary. If this path
-	// really changed, its own independent evidence must be allowed to replace
-	// the inherited value in either direction; treating the inheritance as a
-	// local lower envelope would lock a worse path to the old rate forever.
-	changed := lossmodel.Snapshot{
-		Decided: 200, Samples: 200, Loss: 0.55, LossAfterArrival: 0.55,
-		BurstFactor: 1, Floor: 0.55,
-	}
-	if floor, _ := seeded.establishedErasureFloor(changed); floor != 0.55 {
-		t.Fatalf("new connection remained locked to inherited floor: %.3f", floor)
 	}
 }
 
@@ -429,7 +227,7 @@ func TestAJoiningSenderUsesButDoesNotClaimTheInheritedFloor(t *testing.T) {
 func TestAJoiningSenderStartsWithTheWindowItsRateImplies(t *testing.T) {
 	const rate, roundTrip = 2e6, 250 * time.Millisecond
 	model := pathmodel.NewPathModel()
-	model.Report(1, 0.42, 5000, 5000, rate, roundTrip)
+	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: roundTrip})
 
 	seeded := NewErasureSenderOn(1200, model)
 	fresh := NewErasureSender(1200)
@@ -449,7 +247,7 @@ func TestAJoiningSenderStartsWithTheWindowItsRateImplies(t *testing.T) {
 	// sender must still start from the rate rather than refusing to start.
 	blind := NewErasureSenderOn(1200, func() *pathmodel.PathModel {
 		m := pathmodel.NewPathModel()
-		m.Report(1, 0.42, 5000, 5000, rate, 0)
+		m.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: 0})
 		return m
 	}())
 	if blind.bandwidth() <= NewErasureSender(1200).bandwidth() {
@@ -475,7 +273,7 @@ func TestAnEmptiedPipeKeepsWhatItMeasured(t *testing.T) {
 	sender.seedBandwidth(peak, sender.minRTT)
 	sender.peakBandwidth = peak
 	sender.estimator.maxFilter.reset()
-	sender.estimator.maxFilter.updateMax(sender.round, peak/32)
+	sender.estimator.maxFilter.updateMax(sender.round, monotime.Time(0), peak/32)
 	if before := sender.estimator.estimate(); before >= peak {
 		t.Fatalf("the filter still holds %d; this test is not testing decay", before)
 	}
@@ -486,5 +284,313 @@ func TestAnEmptiedPipeKeepsWhatItMeasured(t *testing.T) {
 	if got := sender.estimator.estimate(); got < peak {
 		t.Errorf("a connection that had measured %d bytes/s restarted from %d, "+
 			"and will spend cycles climbing back to what it already knew", peak, got)
+	}
+}
+
+// Every loss now reaches the controller, so what this sender saw and what the
+// controller was charged must be the same number.
+//
+// They are derived independently -- one from this sender's own counter, one
+// from the controller's telemetry -- so the agreement is a check rather than a
+// tautology. While loss was classified they differed by most of the loss, and
+// publishing only the controller's figure let a gateway erasing a fifth of its
+// downstream report single-digit loss.
+func TestEveryLossReachesTheController(t *testing.T) {
+	e := NewErasureSender(1200)
+
+	const erasure = 0.2
+	rng := rand.New(rand.NewSource(7))
+	number := quiccongestion.PacketNumber(0)
+	observedLost := 0
+	for round := 0; round < 40; round++ {
+		var acked []quiccongestion.AckedPacketInfo
+		var lost []quiccongestion.LostPacketInfo
+		for i := 0; i < 500; i++ {
+			if rng.Float64() < erasure {
+				lost = append(lost, quiccongestion.LostPacketInfo{PacketNumber: number, BytesLost: 1200})
+				observedLost++
+			} else {
+				acked = append(acked, quiccongestion.AckedPacketInfo{PacketNumber: number, BytesAcked: 1200})
+			}
+			number++
+		}
+		e.OnCongestionEventEx(0, monotime.Now(), acked, lost)
+	}
+
+	telemetry := e.Telemetry()
+	_, passed := e.Channel()
+	t.Logf("observed=%d charged=%d (channel lost %d of %d)",
+		telemetry.PacketsLostObserved, telemetry.PacketsLost, observedLost, number)
+
+	if telemetry.PacketsLostObserved != uint64(observedLost) {
+		t.Fatalf("observed %d losses, the channel produced %d", telemetry.PacketsLostObserved, observedLost)
+	}
+	if telemetry.PacketsLostObserved != telemetry.PacketsLost {
+		t.Fatalf("this sender saw %d losses and the controller was charged %d; nothing should be "+
+			"withheld any more", telemetry.PacketsLostObserved, telemetry.PacketsLost)
+	}
+	if passed != uint64(observedLost) {
+		t.Fatalf("the sender's own counter says %d against a channel that lost %d", passed, observedLost)
+	}
+}
+
+// Charging the controller for every loss must not put it into recovery on an
+// erasure path. That is the collapse this controller exists to avoid, and it is
+// the reason loss used to be classified before being forwarded.
+func TestErasureDoesNotDriveTheControllerIntoRecovery(t *testing.T) {
+	e := NewErasureSender(1200)
+	rng := rand.New(rand.NewSource(11))
+	number := quiccongestion.PacketNumber(0)
+	for round := 0; round < 30; round++ {
+		var acked []quiccongestion.AckedPacketInfo
+		var lost []quiccongestion.LostPacketInfo
+		for i := 0; i < 400; i++ {
+			if rng.Float64() < 0.42 {
+				lost = append(lost, quiccongestion.LostPacketInfo{PacketNumber: number, BytesLost: 1200})
+			} else {
+				acked = append(acked, quiccongestion.AckedPacketInfo{PacketNumber: number, BytesAcked: 1200})
+			}
+			number++
+		}
+		e.OnCongestionEventEx(0, monotime.Now(), acked, lost)
+	}
+	if e.InRecovery() {
+		t.Fatal("a 42% erasure channel put the controller into recovery; loss is being read as congestion")
+	}
+}
+
+// A controller that classifies nothing must still answer the same question, or
+// a dashboard cannot read one metric across the kinds this build ships.
+func TestControllersThatDoNotClassifyReportObservedEqualToCharged(t *testing.T) {
+	for name, sender := range map[string]interface {
+		OnCongestionEventEx(quiccongestion.ByteCount, monotime.Time, []quiccongestion.AckedPacketInfo, []quiccongestion.LostPacketInfo)
+		Telemetry() ControllerTelemetry
+	}{
+		"bbr-tuic": NewTUICBBRSender(1200),
+		"brutal":   NewBrutalSender(1_000_000, false),
+	} {
+		t.Run(name, func(t *testing.T) {
+			sender.OnCongestionEventEx(12_000, monotime.Now(), nil, losses(6))
+			got := sender.Telemetry()
+			if got.PacketsLostObserved != got.PacketsLost {
+				t.Fatalf("observed %d against charged %d for a controller that classifies nothing",
+					got.PacketsLostObserved, got.PacketsLost)
+			}
+		})
+	}
+}
+
+// The code is sized from the measured erasure and the pacer from the floor, and
+// the two are different numbers about the same channel. A trace that carries
+// only the floor cannot explain a code rate, which is what made the live
+// incident unreadable: the floor read 1.76% while the channel erased 19.9%.
+func TestTheSenderPublishesTheMeasurementItsCodeIsSizedFrom(t *testing.T) {
+	model := pathmodel.NewPathModel()
+	// A model whose floor and measurement disagree the way the live one did.
+	model.Report(2, pathmodel.Observation{
+		Erasure: 0.199, BurstFactor: 1,
+		ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+	})
+	e := NewErasureSenderOn(1200, model)
+
+	// One congestion event is enough to make this sender a member and pull the
+	// pooled state through.
+	e.OnCongestionEventEx(0, monotime.Now(), []quiccongestion.AckedPacketInfo{
+		{PacketNumber: 1, BytesAcked: 1200},
+	}, nil)
+
+	got := e.Telemetry()
+	t.Logf("published erasure %.4f", got.Erasure)
+	if got.Erasure < 0.1 {
+		t.Fatalf("the sender published %.4f on a path measured at 0.199", got.Erasure)
+	}
+
+}
+
+// characterized gives a sender the evidence the burst rule needs before it will
+// read a clean channel as clean. The tests below state the estimator's
+// conclusions directly rather than driving packets through it, so they have to
+// state how much was behind them as well: a sender that has just started has
+// measured nothing, and nothing is not a report of a clean path.
+func characterized(e *ErasureSender) *ErasureSender {
+	e.samples.Store(burstEvidenceSamples)
+	return e
+}
+
+// The pacer used to meter every send at a bandwidth estimate that a
+// request-shaped flow cannot raise, because such a flow is application-limited
+// by construction. On the measured datacenter path that cost 67ms of a 355KB
+// request, which was the whole of this transport's deficit against a tuned TCP
+// client on the same link.
+//
+// The controller already knew there was nothing to protect: no queue beyond the
+// path's own minimum, and no loss the estimator attributed to rate. These pin
+// that the burst follows that evidence rather than a constant.
+func TestNoCongestionEvidenceMeansNoMetering(t *testing.T) {
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 202*time.Millisecond))
+	got := e.unmeteredBurst()
+	if got <= 0 {
+		t.Fatal("a path holding almost no queue, with no loss attributed to rate, is " +
+			"still being metered; the pacer is protecting a queue that is not forming")
+	}
+	if want := e.GetCongestionWindow(); got != want {
+		t.Fatalf("unmetered burst is %d, want the congestion window %d: below the delay "+
+			"bound, the window and the acknowledgement clock are what bound the send",
+			got, want)
+	}
+}
+
+// The delay bound permits a queue of one round trip. At it, the sender is doing
+// the thing pacing exists to prevent, so metering has to come back.
+func TestAQueueAtTheBoundRestoresMetering(t *testing.T) {
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 400*time.Millisecond))
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("a path holding a full round trip of queue reported an unmetered burst "+
+			"of %d; that is the bound this controller says must not be exceeded", got)
+	}
+}
+
+// Loss that only appears when you push is the other half of the evidence, and
+// separating it from the channel's own erasure is what this project is for.
+// Erasure alone must not restore metering; congestive loss must.
+func TestOnlyCongestiveLossRestoresMetering(t *testing.T) {
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond))
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("precondition: a quiet path should not be metered")
+	}
+	e.congestive.Store(uint64(0.02 * partsPerMillion))
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("with 2%% of loss attributed to rate the burst is still %d; that is the "+
+			"one signal a sender can act on by slowing down", got)
+	}
+	e.congestive.Store(0)
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("metering did not lift once the rate-dependent loss went away")
+	}
+}
+
+// Without round-trip measurements there is no delay signal, so there is no
+// evidence of absence either and the constant has to stand.
+func TestNoRoundTripMeasurementKeepsTheConstant(t *testing.T) {
+	e := NewErasureSender(1200)
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("a sender with no round-trip measurement reported %d; it cannot know "+
+			"whether a queue is forming, so it must not stop metering", got)
+	}
+}
+
+// A policer is the path where bursting is worst and where both of the signals
+// above read clean: it holds no queue, and its loss is sustained enough that
+// the estimator's floor rises to meet it and reports nothing congestive.
+// Gating on those two alone took an emulated policer from 3.0x overdrive to
+// 4.0x and from 32.9% loss to 54.9%, because metering was the last thing
+// holding the rate down. See internal/pep/case4_test.go.
+func TestALossyDirectionIsStillMetered(t *testing.T) {
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond))
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("precondition: a clean quiet path should not be metered")
+	}
+	e.erasure.Store(uint64(0.33 * partsPerMillion))
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("a direction losing a third of what it sends reported an unmetered "+
+			"burst of %d; on a policed path neither the delay bound nor the congestive "+
+			"component can see the overload, so this is the only thing left", got)
+	}
+}
+
+// The datacenter path's upload direction lost nothing at all, which is the case
+// the burst exists for. A trace of loss must not close the gate, or the rule
+// would never fire on a real link.
+func TestAnAlmostCleanDirectionStillBursts(t *testing.T) {
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond))
+	e.erasure.Store(uint64(0.001 * partsPerMillion))
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("a direction losing one packet in a thousand is being metered; the " +
+			"measured datacenter upload lost 0 of 41,663 and this rule has to fire there")
+	}
+}
+
+// The burst has to come out of what the path already holds, not be added to
+// it. Every signal the two rules above consult reads clean for a saturating
+// flow on an erasing path -- no queue past the minimum, no loss attributed to
+// rate -- so without this the flow was handed a further bandwidth-delay
+// product on top of a window that was already in flight. It drove that into
+// the bottleneck, the delay brake read the queue that built, and the rate it
+// clamped to was the rate the flow kept: on the emulated erasure path the
+// erasure controller fell from 10.5 to 0.9 Mbit/s of a 14.5 Mbit/s capacity,
+// and monotonically worse the larger the burst.
+//
+// TestTheErasureControllerReachesThePathOthersGiveAway is what caught it, and
+// that test skips under -short, so it reached main through a green CI and was
+// found by a release candidate. This one is here so the next such change fails
+// in the normal suite instead.
+func TestAFlowAlreadyUsingThePathIsStillMetered(t *testing.T) {
+	const minRTT = 200 * time.Millisecond
+	e := characterized(senderAtRTT(t, minRTT, minRTT+2*time.Millisecond))
+
+	// The product is computed from what the path delivers rather than from
+	// what this sender puts on the wire. The two differ by the erasure
+	// compensation, and it is the delivered figure that says how much the path
+	// holds; the compensated one says only that we send more to get it there.
+	product := quiccongestion.ByteCount(float64(e.inner.bandwidth()) * minRTT.Seconds())
+	if product <= 0 {
+		t.Fatalf("no bandwidth-delay product to reason about: %d", product)
+	}
+
+	// An empty pipe is the case the burst exists for and must keep.
+	e.TimeUntilSend(0)
+	empty := e.unmeteredBurst()
+	if empty <= 0 {
+		t.Fatal("a flow with an empty pipe on an uncongested path is being metered; " +
+			"that is the 355KB request this rule was written for")
+	}
+
+	// A flow already holding a product is doing the thing pacing exists to
+	// bound, whatever the other two signals say about it.
+	e.TimeUntilSend(product)
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Errorf("a flow already holding one product in flight was granted a further "+
+			"%d bytes unmetered; the burst has to be what the path holds, not an "+
+			"addition to it", got)
+	}
+
+	// And between the two the allowance is what remains of the product, so it
+	// falls as the pipe fills rather than switching off at one end of it. The
+	// window is the other bound and binds first on an empty pipe, so leave
+	// less than a window of the product to see the product doing the work.
+	window := e.GetCongestionWindow()
+	e.TimeUntilSend(product - window/2)
+	partial := e.unmeteredBurst()
+	if partial != window/2 {
+		t.Errorf("with %d bytes of the product unused, the allowance is %d, want %d: "+
+			"what is left of it", window/2, partial, window/2)
+	}
+	if partial >= empty {
+		t.Errorf("a part-full pipe was granted %d, no less than the %d an empty one "+
+			"gets", partial, empty)
+	}
+}
+
+// Both gates read their own zero value as a clean channel, so a sender that has
+// measured nothing looks exactly like a sender on a perfect path. It is not the
+// same claim, and reading it as one granted a startup burst on a channel erasing
+// 42%: by the time the erasure ceiling had a measurement to refuse with, the
+// burst had built the queue that the delay brake then holds the rate down for.
+// Closing this window was worth about a tenth of the erasure controller's rate
+// on the emulated path, over and above the in-flight bound above.
+func TestAChannelNothingHasMeasuredIsNotACleanChannel(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 202*time.Millisecond)
+	e.TimeUntilSend(0)
+
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Errorf("a sender that has decided no packets granted a burst of %d; nothing "+
+			"has reported on this channel, and nothing is not a report of a clean one", got)
+	}
+
+	// The same sender, once there is evidence behind that reading.
+	e.samples.Store(burstEvidenceSamples)
+	if e.unmeteredBurst() <= 0 {
+		t.Error("a measured clean path is being metered; the evidence gate has to open " +
+			"once there is evidence, or the burst never fires on a real link")
 	}
 }

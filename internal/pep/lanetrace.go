@@ -59,7 +59,7 @@ func traceLane(f *multipathFlow, laneID uint64, stats laneTransportStats) {
 		"t", time.Since(traceStart).Seconds(), "flow", fmt.Sprintf("%p", f), "flow_id", f.flowID, "lane", laneID,
 		"cwnd", c.CongestionWindow, "inflight", c.BytesInFlight,
 		"minrtt", float64(c.MinRTT.Microseconds())/1000, "srtt", float64(stats.smoothedRTT.Microseconds())/1000,
-		"pacing", c.PacingRate, "maxbw", c.MaxBandwidth, "floor", c.ErasureFloor,
+		"pacing", c.PacingRate, "maxbw", c.MaxBandwidth, "erasure", c.Erasure,
 		"round", c.Round, "appsamp", c.AppSamples, "nonapp", c.NonAppSamples,
 		"window", window, "held", held, "queued", queued, "chunks", chunks, "ready", ready, "flowheld", flowHeld,
 		"issued", issued, "reissued", reissued, "source", sourceBytes, "breissued", reissuedBytes, "lanefail", laneFailures,
@@ -67,7 +67,10 @@ func traceLane(f *multipathFlow, laneID uint64, stats laneTransportStats) {
 		"acksin", f.acksIn.Swap(0), "acksout", f.acksOut.Swap(0), "acksched", f.acksSched.Swap(0),
 		"ackwr", float64(f.ackWriteNS.Swap(0))/1e6,
 		"sent", stats.bytesSent, "pktsent", stats.packetsSent, "pktrecv", stats.packetsReceived,
-		"lostbytes", stats.bytesLost, "lost", stats.packetsLost, "mode", c.Mode)
+		// What the path did, not what the controller was charged. quic-go's own
+		// loss counters are absent because this transport replaces its
+		// congestion controller, so they never leave zero.
+		"lost", c.PacketsLostObserved, "lostcong", c.PacketsLost, "mode", c.Mode)
 }
 
 // residency records how long a chunk stays in the scheduler's window: from the

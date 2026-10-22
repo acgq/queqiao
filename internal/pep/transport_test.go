@@ -13,6 +13,7 @@ import (
 
 	"github.com/apernet/quic-go"
 	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/netbind"
 )
 
 type routeErrorPacketConn struct{ err error }
@@ -35,18 +36,26 @@ type routeErrorOOBConn struct {
 type switchableRouteConn struct {
 	*net.UDPConn
 	failing atomic.Bool
+	err     error
+}
+
+func (c *switchableRouteConn) failure() error {
+	if c.err != nil {
+		return c.err
+	}
+	return injectedRouteError
 }
 
 func (c *switchableRouteConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
 	if c.failing.Load() {
-		return 0, injectedRouteError
+		return 0, c.failure()
 	}
 	return c.UDPConn.WriteTo(payload, addr)
 }
 
 func (c *switchableRouteConn) WriteMsgUDP(payload, oob []byte, addr *net.UDPAddr) (int, int, error) {
 	if c.failing.Load() {
-		return 0, 0, injectedRouteError
+		return 0, 0, c.failure()
 	}
 	return c.UDPConn.WriteMsgUDP(payload, oob, addr)
 }
@@ -84,6 +93,18 @@ func TestPermanentUDPSocketErrorsRemainFatal(t *testing.T) {
 	conn := tolerateTransientRouteErrors(&routeErrorPacketConn{err: want}, nil)
 	if _, err := conn.WriteTo([]byte("packet"), &net.UDPAddr{}); !errors.Is(err, permanentSocketError) {
 		t.Fatalf("permanent socket error = %v, want %v", err, permanentSocketError)
+	}
+}
+
+func TestVanishedSourceAddressRemainsFatal(t *testing.T) {
+	want := &net.OpError{Op: "write", Net: "udp", Err: staleSourceWriteSample.err}
+	observed := 0
+	conn := tolerateTransientRouteErrors(&routeErrorPacketConn{err: want}, func(error) { observed++ })
+	if _, err := conn.WriteTo([]byte("packet"), &net.UDPAddr{}); !errors.Is(err, staleSourceWriteSample.err) {
+		t.Fatalf("vanished source write = %v, want %v", err, staleSourceWriteSample.err)
+	}
+	if observed != 0 {
+		t.Fatalf("vanished source was reported as transient %d times", observed)
 	}
 }
 
@@ -199,6 +220,70 @@ func TestQUICConnectionSurvivesATransientLocalRouteOutage(t *testing.T) {
 	}
 }
 
+func TestQUICConnectionClosesWhenItsBoundSourceDisappears(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	serverTLS, err := identity.ServerTLSConfig(serverCredentials, defaultALPN, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTLS, err := tlsClientConfig(clientCredentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPacket, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverPacket.Close()
+	listener, err := quic.Listen(serverPacket, serverTLS, quicConfig(flowWindows{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		conn, acceptErr := listener.Accept(ctx)
+		if acceptErr != nil {
+			return
+		}
+		stream, acceptErr := conn.AcceptStream(ctx)
+		if acceptErr == nil {
+			var one [1]byte
+			_, _ = stream.Read(one[:])
+		}
+	}()
+
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults := &switchableRouteConn{UDPConn: udp, err: staleSourceWriteSample.err}
+	packet := tolerateTransientRouteErrors(faults, nil)
+	remote := serverPacket.LocalAddr().(*net.UDPAddr)
+	conn, err := quic.Dial(ctx, packet, remote, clientTLS, quicConfig(flowWindows{}))
+	if err != nil {
+		_ = packet.Close()
+		t.Fatal(err)
+	}
+	defer packet.Close()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults.failing.Store(true)
+	_, _ = stream.Write(make([]byte, 64*1024))
+	select {
+	case <-conn.Context().Done():
+		if conn.Context().Err() == nil {
+			t.Fatal("closed connection has no terminal error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("QUIC kept a connection whose bound source address disappeared")
+	}
+}
+
 type closeTrackingQUICStream struct {
 	cancelReads int
 	closes      int
@@ -308,12 +393,15 @@ func TestValidateLocalAddressSpec(t *testing.T) {
 }
 
 func TestResolveLocalAddressLiteral(t *testing.T) {
-	got, err := resolveLocalAddress("192.0.2.10")
+	got, err := netbind.ResolveWithInterface("192.0.2.10")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.String() != "192.0.2.10" {
-		t.Fatalf("resolved literal = %s", got)
+	if got.Addr.String() != "192.0.2.10" {
+		t.Fatalf("resolved literal = %s", got.Addr)
+	}
+	if got.InterfaceName != "" {
+		t.Fatalf("literal IP should have no interface name, got %q", got.InterfaceName)
 	}
 }
 
@@ -321,15 +409,15 @@ func TestResolveLocalAddressAutoOrInterfaceReportsOperationalState(t *testing.T)
 	// The CI host may have no physical IPv4 interface, or may expose more than
 	// one. In either case the important contract is a bounded, actionable error;
 	// when auto succeeds it must return an IPv4 address that can be bound.
-	got, err := resolveLocalAddress("auto")
+	got, err := netbind.ResolveWithInterface("auto")
 	if err != nil {
 		if !strings.Contains(err.Error(), "IPv4") && !strings.Contains(err.Error(), "physical") {
 			t.Fatalf("unexpected auto-resolution error: %v", err)
 		}
 		return
 	}
-	if !got.Is4() {
-		t.Fatalf("auto selected non-IPv4 address %s", got)
+	if !got.Addr.Is4() {
+		t.Fatalf("auto selected non-IPv4 address %s", got.Addr)
 	}
 }
 

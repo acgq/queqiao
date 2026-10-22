@@ -103,21 +103,117 @@ Prometheus `/metrics` names. They cover:
 
 - active/started/completed/failed flows and transferred bytes;
 - latest, smoothed, and controller-minimum RTT;
-- QUIC sent, received, and lost bytes plus sent, received, and lost packets;
+- QUIC sent and received bytes and packets, and two loss counters that are now
+  the same number derived two ways: `queqiao_quic_loss_observed_packets_total`
+  is every loss the sender detected, and `queqiao_quic_controller_packets_lost`
+  is what the congestion controller was charged. Nothing is withheld from the
+  controller any more, so they agree; they are both kept so that a divergence
+  is visible rather than silent. Divide either by `queqiao_quic_packets_sent`
+  for a loss rate;
 - delivery, ACK, send, pacing, and maximum-bandwidth estimates;
 - congestion window, bytes in flight, controller round/mode/recovery;
 - lanes, failures, replacements, reinjections, fallbacks, and timeouts;
 - transient local UDP send errors absorbed into QUIC loss recovery;
 - flow telemetry entries expired because nothing refreshed them, which is how
   a round-trip aggregate frozen at a stale constant announces itself;
-- lane joins refused and account flow opens refused, each split by reason; and
-- the controller's measured erasure floor, sampler diagnostics, and class
-  transitions.
+- lane joins refused and account flow opens refused, each split by reason;
+- the flow-stall watchdog and its parallel rescue:
+  `queqiao_flow_stalls_detected_total` counts stall episodes (unacknowledged transport work pending
+  with no forward progress for three minimum round trips; application response
+  silence alone is not a stall),
+  `queqiao_stall_spare_attaches_total` counts stalls where an already-healthy
+  lane took over at once, `queqiao_lane_rescue_attempts_total` counts
+  individual dial+JOIN attempts and
+  `queqiao_lane_rescue_wins_total{attempt="N"}` which attempt of a round
+  produced the lane the flow kept -- a win above zero is an independent QUIC
+  dial beating the shared QUIC strategy; attempt zero also counts the
+  sequential TCP fallback after the QUIC race fails. TCP JOINs never race
+  QUIC JOINs because admission immediately retires QUIC on the gateway, and
+  `queqiao_lane_grace_extensions_total` counts replacement graces a gateway
+  restarted because a rescue JOIN arrived while the flow was still waiting;
+  and
+- the erasure the path is measured to be applying to the direction this
+  endpoint sends into, published as `queqiao_erasure_ratio{direction="send"}`
+  and as `queqiao_erasure_ratio_send` in the log. A gateway's send direction is
+  its downstream. This is what a code is sized from;
+- the shape of the delivery-rate samples the bandwidth estimate is built from:
+  `queqiao_quic_sample_mean_bytes_per_second`,
+  `queqiao_quic_sample_max_bytes_per_second`, and the
+  `..._max_delivered_bytes` and `..._max_interval_seconds` behind that widest
+  sample. The estimate is a maximum over these samples, and a maximum alone
+  cannot be read: a rate is high either because the path is fast or because the
+  window it was measured over was short. A maximum far above the mean is a tail
+  rather than the path, and a tail measured over a short interval is a
+  measurement artefact rather than either;
+- how much of the sending rate the delay bound is removing, as
+  `queqiao_delay_brake_ratio`. It is non-zero only while the path is carrying
+  more than one bandwidth-delay product of queue, and it separates a rate held
+  back by the path's own queue from one that simply measured less;
+- the receive direction, measured by this endpoint's decoders rather than
+  inferred from acknowledgements: `queqiao_coded_symbols_total` split by
+  outcome (`arrived`, `recovered`, `lost`), with
+  `queqiao_erasure_ratio{direction="receive"}` and
+  `queqiao_erasure_residual_ratio{direction="receive"}` derived from them. Every
+  source symbol the peer sent ends in exactly one outcome, so the three are a
+  denominator and the ratios are counters over counters rather than a mean of
+  per-flow ratios. The residual is what the code could not repair and the
+  session re-issues a round trip later; and
+- sampler diagnostics and class transitions.
 
-The dashboard calculates interval packet loss from changes in sent and lost
-packet counters. QUIC can later recognize a packet previously declared lost,
-so its lost byte/packet counters are allowed to decrease; the dashboard skips
-that interval instead of displaying a fabricated negative loss rate.
+Flow completion records also carry what the flow's lane replacements did:
+`lane_replacement_waits`, `lane_replacement_timeouts`, `lane_replacement_wait`,
+and `lanes_joined`. They are written on every flow record, not only on
+failures, because a replacement that succeeded is the control case for one that
+did not. A flow that never lost its last healthy lane reports zeroes. Both
+endpoints use the same names, so a client record and a gateway record about the
+same failure can be read side by side.
+
+`lane_replacement_attempts` and `lane_replacement_failures` say what the
+endpoint that opens replacements actually did, and are the pair that separates
+a client pool which will not rebuild from a path which will not carry a
+handshake. No attempts means nothing was dialled; attempts equal to failures
+means every dial was made and none completed; attempts above failures means
+dials are still outstanding. They are written by both endpoints under the same
+names, and a gateway reports zeroes because it opens nothing -- the replacement
+is the client's to send. `lanes_joined` cannot answer this on its own: a dial
+whose handshake never completes never reaches lane admission, so it leaves the
+record identical to a flow where nothing was tried.
+
+`lane_replacement_waits` counts waiters, not graces. The flow's run loop, its
+frame and control writers, and its acknowledgement loop all wait for a missing
+lane, so a lane that dies with writes in flight leaves several of them waiting
+for the same replacement, and a count above one says how much of the flow was
+stuck rather than how long it waited. The grace belongs to the outage: reading
+`lane_replacement_wait` against it tells you whether the flow waited out a
+whole outage or ended early, and `lanes_joined` tells you whether anything ever
+arrived to end one.
+
+The dashboard calculates interval packet loss from changes in
+`queqiao_quic_packets_sent` and `queqiao_quic_loss_observed_packets_total`.
+`queqiao_quic_packets_lost` and `queqiao_quic_bytes_lost` were removed: they
+were quic-go's own counters, incremented only inside its cubic sender, and this
+transport installs its own controller, so nothing ever moved them off zero
+while the dashboard divided by them. A counter that cannot be produced is worse
+than a missing one once it is monotonic, because it then reads as a
+measurement. Those counters are process-wide monotonic totals: they are
+accumulated from the forward movement of each QUIC connection, measured once
+per connection against a baseline the connection itself holds.
+
+That scoping is what makes the difference between two scrapes mean something.
+A QUIC connection here is pooled, so at any moment several lanes belonging to
+several flows are reading the same counters out of the same connection, and
+each of those flows publishes telemetry on its own timer. Adding up what the
+live flows currently report would count one connection once per flow
+referencing it, and would move the total up and down as flows start and end --
+so an interval difference would measure flow churn rather than the path, in
+both the numerator and the denominator. Neither a flow ending nor its
+telemetry expiring moves these counters now; both only retire gauges.
+
+Within one interval a counter can still fail to advance. QUIC may recognize a
+packet it previously declared lost, and a pooled connection replaced by a new
+generation restarts its counters at zero. Both are read as no forward
+movement rather than as a negative or a wrapped-around jump, and the
+connection is re-baselined at the new reading.
 
 A gateway that refuses a lane join writes `msg="lane join refused"` with the
 reason at `info`, or at `warn` for a flow or principal mismatch, which are a
@@ -190,3 +286,13 @@ Rotation is internal and does not require `logrotate`, a SIGHUP, or reopening
 the process. Do not configure an external rotator to rename the same files.
 The process fails startup rather than silently running without its configured
 file when the directory cannot be created or the file cannot be opened.
+
+Do not capture stdout or stderr to a file from the service manager either. A
+LaunchAgent `StandardOutPath` or `StandardErrorPath`, or a systemd
+`StandardOutput=file:`, stores a second copy of every line somewhere nothing
+rotates, so it grows without bound while the rotating log beside it stays
+within its five backups. Mirroring to a journal is not the same thing:
+journald applies its own retention, which is why the generated systemd unit
+leaves stderr on, while the generated LaunchAgent has no journal to write to
+and passes `--log-stderr=false` instead. A unit hand-written before that
+should drop the redirect, pass `--log-stderr=false`, or both.

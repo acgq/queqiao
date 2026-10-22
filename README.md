@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Make difficult long-haul links feel local.</strong><br>
-  An open-source, self-hosted transport for TCP and UDP across a known WAN bottleneck.
+  An open-source, self-hosted transport for TCP and UDP across a long link you control both ends of.
 </p>
 
 <p align="center">
@@ -32,6 +32,27 @@ client-to-gateway deployments. It carries TCP and UDP through a local proxy over
 an authenticated transport, and keeps evolving as we measure more paths,
 improve the transport, and learn from users.
 
+### Not only client to gateway, but also inter-datacenter
+
+The same problem turned up between two datacenter servers. This has been our own
+pain point since 2023: the models run in the US and the clients are everywhere.
+ASR sends a few hundred kilobytes of audio up and gets a sentence back.
+TTS sends a sentence up and gets a few hundred kilobytes back, in one
+burst once the model finishes. Each is a single transfer that has to finish
+before anything else happens, which is the shape a long path is worst at.
+
+Guiyang, China to a model in Irvine, US: a 355KB audio upload takes **1185ms**, of
+which the ASR model only spends about 30ms.
+In theory, the path's bandwidth could carry 355KB in about 9ms.
+The rest is a handshake, a transfer starting at ten segments, and a window
+thrown away between requests.
+Queqiao approaches the limits of this 200ms RTT link, achieving **302ms** end-to-end
+on a cold connection and **237ms** once warm, which is the floor. On a sustained
+transfer it reaches **310 Mbit/s**, 93% of what the path itself carries, against
+3.6 to 106 Mbit/s for direct TCP.
+[Why this profile exists](docs/DESIGN-DC-PROFILE.md) walks through each request; [the
+runbook](docs/DEPLOYING-DC-PROFILE.md) is how to deploy it.
+
 ## Why Queqiao?
 
 Many transports make each connection learn and react on its own. That is a
@@ -51,9 +72,14 @@ Queqiao is built around a few practical observations:
 - **Flows sharing one bottleneck should share one model.** Flows to different final
   destinations can still share one client-to-gateway path, so Queqiao shares
   delivery, loss, RTT, pacing, and latency-reserve state across them.
-- **Not all packet loss means congestion.** The controller distinguishes a measured
-  erasure floor from loss caused by an overloaded bottleneck instead of treating
-  every missing packet as congestion.
+- **Not all packet loss means congestion.** A path that erases packets
+  independently of the sending rate is not an overloaded one, and backing off
+  does not make an erasure channel drop less. So loss is not the congestion
+  signal here: the brake is a delay bound, the round trip may not exceed twice
+  the path's own minimum, and the measured erasure is what sizes the code and
+  compensates the window instead. A policer, which drops without queueing, is
+  the case this does not yet brake -- see the [known
+  limitations](docs/KNOWN-LIMITATIONS.md).
 - **Choose recovery for the path.** On a long-RTT path, forward-error
   correction can recover a gap sooner than another round trip; as a flow grows,
   retransmission can become the more efficient choice.
@@ -118,63 +144,98 @@ workload; see the full [comparison and methodology](docs/COMPARISON.md).
   listener, for Clash/mihomo routing and failover.
 - Bounded JSON logs, metrics, a local visualizer, deterministic benchmarks,
   release packaging, SBOMs, and rollback procedures.
+- `queqiaod segments`, which profiles a live tunnel and says *which* segment
+  the loss is on — the client's own access link, the long haul this transport
+  carries, or the gateway's transit onward — measuring the far end over SSH
+  rather than inferring it. See [which segment is at
+  fault](docs/PROFILING-A-TUNNEL.md).
+
+All of it ships as a prebuilt binary. Download it below, or from the
+[latest release](https://github.com/bojieli/queqiao/releases/latest); there is no build step for normal use.
 
 ## Platform availability
 
-- **macOS and Linux:** desktop and provider-gateway builds are available to use
-  from source today.
-- **Windows:** native release targets are built, but the Windows client is
-  currently under testing and is not presented as production-ready.
-- **Android and iOS:** clients use the same protocol-1 core and are currently
-  under testing. They are not yet presented as production-ready mobile apps.
+Every release publishes reproducible, signed binaries for six native targets.
+The links below are v0.10.0, the current release; the
+[releases page](https://github.com/bojieli/queqiao/releases/latest) always has the newest.
+
+| Platform | Status | Download |
+| --- | --- | --- |
+| macOS, Apple silicon | Desktop and gateway, ready to use | [`darwin_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.10.0/queqiaod_v0.10.0_darwin_arm64_signed.zip), notarized |
+| macOS, Intel | Desktop and gateway, ready to use | [`darwin_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.10.0/queqiaod_v0.10.0_darwin_amd64_signed.zip), notarized |
+| Linux, x86-64 | Desktop and gateway, ready to use | [`linux_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.10.0/queqiaod_v0.10.0_linux_amd64.tar.gz) |
+| Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.10.0/queqiaod_v0.10.0_linux_arm64.tar.gz) |
+| Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.10.0/queqiaod_v0.10.0_windows_amd64.zip) |
+| Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.10.0/queqiaod_v0.10.0_windows_arm64.zip) |
+| Android and iOS | Same protocol-1 core, under testing; not yet production-ready mobile apps | -- |
+
+Check a download against its release's
+[`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.10.0/SHA256SUMS)
+before running it. Each archive carries its own CycloneDX SBOM and the complete
+license text for every module linked into the binary.
 
 ## Quick start
 
-Build from source with the Go version declared in [`go.mod`](go.mod):
+Two scripts perform a whole deployment and verify the result, one per side.
+Neither needs a Go toolchain: point them at the binary you downloaded above.
+
+On the Linux gateway, as root:
+
+```sh
+sudo ./deploy/install-server.sh \
+  --binary ./queqiaod \
+  --name "Example Network" \
+  --endpoint gateway.example.net:443 \
+  --user alice \
+  --tune
+```
+
+That installs the binary, service account, directories, hardened unit, and
+environment file, initializes the provider, creates the first user, starts and
+verifies the gateway, and only then prints one single-use invitation URI.
+Deliver that URI over an authenticated private channel: it is a bearer
+credential.
+
+On the client, as the account that will use the tunnel -- not with `sudo`:
+
+```sh
+./deploy/install-client.sh --binary ./queqiaod --invite 'queqiao://enroll/...'
+```
+
+That enrolls the invitation, writes the profile and manifest, installs a
+per-user service that starts at login -- a LaunchAgent on macOS, a systemd
+`--user` unit on Linux -- and checks end to end that traffic reaches the
+gateway. Repeat `--invite` to add providers, each on its own loopback port.
+
+The client listens on `127.0.0.1:12080`, the port
+[`deploy/clash-queqiao.yaml`](deploy/clash-queqiao.yaml) already points at.
+Point an application or Clash/mihomo at that SOCKS5 endpoint.
+
+The scripts live in this repository: clone it, or copy `deploy/` beside the
+downloaded binary. From the next release they also ship inside the archives.
+
+[Choosing and placing a gateway](docs/CHOOSING-A-GATEWAY.md) is the decision
+that comes before all of this: whether a gateway will help at all, and where it
+has to sit. The [deployment guide](docs/DEPLOYING.md) is the reference for
+everything past this point -- what the scripts do, the hosts they do not cover, the manual
+gateway and enrollment steps for a host they do not fit, firewall and socket
+tuning, multiple users, source-interface selection, verification, upgrades, and
+rollback. To serve several providers from one client process, see
+[multi-provider](docs/DEPLOYING.md#connect-to-multiple-providers).
+
+## Build from source
+
+Normal use needs no build. Build to develop, or to run on a platform with no
+published archive, using the Go version declared in [`go.mod`](go.mod):
 
 ```sh
 go test ./...
 go build -o ./queqiaod ./cmd/queqiaod
 ```
 
-On the provider gateway, initialize a provider, add a user, and create a
-single-use invitation:
-
-```sh
-sudo ./queqiaod provider init \
-  --state /var/lib/queqiao/provider \
-  --name "Example Network" \
-  --endpoint gateway.example.net:443
-
-sudo ./queqiaod provider add-user \
-  --state /var/lib/queqiao/provider \
-  --name alice \
-  --max-sessions 8
-
-sudo ./queqiaod provider invite \
-  --state /var/lib/queqiao/provider \
-  --user alice
-
-sudo ./queqiaod server \
-  --state /var/lib/queqiao/provider \
-  --listen :443
-```
-
-Send the printed `queqiao://` URI to the user over a private channel. On the
-client:
-
-```sh
-./queqiaod enroll 'queqiao://enroll/…'
-./queqiaod client --profile ~/.config/queqiao/PROVIDER_ID.json
-```
-
-The client listens on `127.0.0.1:1080` by default. Point an application or
-Clash/mihomo at that SOCKS5 endpoint. The [deployment guide](docs/DEPLOYING.md)
-covers service installation, firewall and socket tuning, multiple users,
-source-interface selection, verification, upgrades, and rollback.
-
-To use several providers from one desktop client process, follow the
-[multi-provider deployment guide](docs/DEPLOYING.md#connect-to-multiple-providers).
+Both installer scripts pick up `./queqiaod` from the repository root on their
+own, so the commands above work unchanged without `--binary`.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) lists the full development checks.
 
 ## Who is it for?
 
@@ -187,14 +248,31 @@ gateway. Typical deployments include:
 | Remote corporate access | employee or remote site to the corporate VPN gateway |
 | Weak access network | hotel, residential, mobile, or rural link to a stable relay |
 | Overlay network | one long-haul leg between two overlay endpoints |
+| Cross-region inference | an application in one region calling ASR, TTS, or an LLM served in another |
 
 The repository provides this paired data plane. Discovery, global routing, and
 a full mesh control plane belong to a larger overlay product built around it.
 
+The last row is served by a second, experimental profile. A hop between two
+regions one operator runs differs from an access link in where its bottleneck
+is, so it gets its own profile rather than the default one: see [the datacenter
+profile](docs/DEPLOYING-DC-PROFILE.md), and read its measured limits before
+deploying it, because on a clean path direction a one-line client-side fix
+beats it on the median request.
+
+Both ends run this software, so a destination someone else operates -- a hosted
+model API, a SaaS endpoint -- needs a gateway on a host you do control. Where
+that gateway goes decides whether any of this helps: a destination already
+served from an anycast edge near you can be made slower by a gateway placed on
+another continent. [Choosing and placing a
+gateway](docs/CHOOSING-A-GATEWAY.md) is how to settle that before spending
+anything, and it covers the free client-side fixes that on a clean path reach
+the same median this transport does.
+
 ## Project status
 
-Queqiao is ready to build and use from source for the supported paired-gateway
-topology. It is a public preview, not a production-ready claim for every
+Queqiao is ready to use for the supported paired-gateway topology, from the
+published binaries or from source. It is a public preview, not a production-ready claim for every
 network. Protocol 1 is the only supported wire version; broader independent
 field qualification, transport and security review, and mobile review remain
 open. See [current status](docs/STATUS.md) for the evidence boundary and

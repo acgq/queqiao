@@ -17,6 +17,8 @@ import (
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/portmux"
+	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
@@ -28,6 +30,9 @@ import (
 const completedSessionLinger = 90 * time.Second
 
 type ServerConfig struct {
+	// Profile names the deployment this gateway serves; see internal/profile.
+	// The zero value is the supported access-link profile.
+	Profile           profile.Profile
 	ListenAddr        string
 	Credentials       identity.ServerCredentials
 	Enrollment        *identity.EnrollmentService
@@ -63,6 +68,13 @@ type ServerConfig struct {
 	// it is a measurement control, and both endpoints must agree for the
 	// comparison to mean anything.
 	UDPOnStream bool
+	// HopPortCount enables the server to accept QUIC connections on multiple
+	// UDP ports simultaneously. It must match the client's hop_port_count in
+	// the profile. 0 and 1 both disable port hopping. Values ≥ 2 cause the
+	// server to listen on that many ports derived from the provider ID and
+	// route responses back through whichever port each client most recently
+	// used.
+	HopPortCount int
 	// testLaneWriteHook is intentionally unexported and nil in production. It
 	// lets package integration tests reproduce loss of a specific logical
 	// frame without depending on encrypted QUIC packet layout.
@@ -134,11 +146,38 @@ func serverLaneBudget(reserveControl bool) int {
 	return bulk + control
 }
 
+// laneJoinAdmissionTimeout bounds the OPEN_OK write of an admitted JOIN. The
+// connection handshake deadline is already cleared by then, so without its
+// own bound a blocked write holds a staged lane -- counted against the
+// admission ceiling, never ready, never schedulable -- for as long as the
+// peer stays half-open. One path-detection budget matches the rescue-race
+// window a young staged lane is protected from eviction for.
+const laneJoinAdmissionTimeout = laneDeadPathDetection
+
+// Lane admission refusals are typed so the join handler can answer with the
+// reset code matching how permanent the refusal is. The client may retry the
+// ceiling answer or hand off to TCP, so only the genuine ceiling may carry
+// ResetFlowLimit; answers that cannot change during the flow's life must not
+// wear it.
+var (
+	// errLaneFlowTCPMode refuses a non-TCP lane: the flow committed to TCP
+	// fallback and stays there for the rest of its life.
+	errLaneFlowTCPMode = errors.New("flow has switched to TCP fallback")
+	// errLaneFlowClosed refuses a lane for a flow that is already gone.
+	errLaneFlowClosed = errors.New("flow is closed")
+	// errLaneDuplicateID refuses a lane id the flow already carries.
+	errLaneDuplicateID = errors.New("duplicate lane id")
+	// errLaneLimitReached is the genuine admission ceiling, the one refusal
+	// a peer may legitimately retry: lanes come and go, so the answer can
+	// change during the flow's life.
+	errLaneLimitReached = errors.New("flow lane limit reached")
+)
+
 func (s *serverFlow) addLane(lane *mpLane) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tcpMode && lane.kind != TransportTCP {
-		return errors.New("flow has switched to TCP fallback")
+		return errLaneFlowTCPMode
 	}
 	if lane.kind == TransportTCP && !s.tcpMode {
 		// The first authenticated TCP rescue is a transport handoff, not another
@@ -150,12 +189,14 @@ func (s *serverFlow) addLane(lane *mpLane) error {
 	}
 	if s.flow.laneCount() >= s.maxLanes {
 		// The peer can detect a dead QUIC socket before this endpoint does
-		// (for example, when the return path is black-holed). Retire the
-		// oldest lane with the same role as its authenticated replacement.
-		// A bulk replacement must never evict the control lane, and a control
-		// generation replacement must not evict healthy bulk capacity.
-		if !s.flow.retireOldestLane(lane.control) || s.flow.laneCount() >= s.maxLanes {
-			return errors.New("flow lane limit reached")
+		// (for example, when the return path is black-holed). Admission at
+		// the ceiling is by eviction, and no role blocks it: the choice is
+		// limited only by the rescue-race window -- lanes whose JOIN
+		// handshake is in flight or whose admission is younger than the
+		// path-detection budget may still be waiting on the peer's crowning
+		// decision, so evicting one can kill the rescue that just won.
+		if !s.flow.retireOldestLane(lane.control, laneDeadPathDetection) || s.flow.laneCount() >= s.maxLanes {
+			return errLaneLimitReached
 		}
 	}
 	if err := s.flow.addLane(lane); err != nil {
@@ -473,11 +514,41 @@ func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn) {
 }
 
 func (s *Server) serveQUIC(ctx context.Context) error {
-	packetConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
+	if s.cfg.HopPortCount < 2 {
+		// Fast path: single port, no mux overhead.
+		packetConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
+		if err != nil {
+			return fmt.Errorf("listen on remote QUIC address: %w", err)
+		}
+		return s.ServePacketConn(ctx, packetConn)
+	}
+
+	// Port-hopping path: bind the primary socket, derive the port list, then
+	// open secondary sockets and hand everything to a ServerPortMux.
+	listenAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("resolve QUIC listen address: %w", err)
+	}
+	primaryConn, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on remote QUIC address: %w", err)
 	}
-	return s.ServePacketConn(ctx, packetConn)
+	primaryPort := primaryConn.LocalAddr().(*net.UDPAddr).Port
+	ports := portmux.HopPorts(s.cfg.Credentials.ProviderID, primaryPort, s.cfg.HopPortCount)
+	mux, err := portmux.NewServerPortMux(primaryConn, ports)
+	if err != nil {
+		_ = primaryConn.Close()
+		return fmt.Errorf("create server port mux: %w", err)
+	}
+	// A pool narrower than configured is reported rather than inferred: the
+	// deployment still works, but it hops across fewer ports than the operator
+	// asked for, and that is a fact about this host worth having in the log.
+	s.cfg.Logger.Info("port hop listener ready",
+		"primary_addr", primaryConn.LocalAddr(),
+		"hop_port_count", len(ports)-len(mux.SkippedPorts()),
+		"hop_ports_configured", len(ports),
+		"hop_ports_unavailable", mux.SkippedPorts())
+	return s.ServePacketConn(ctx, mux)
 }
 
 // ServePacketConn runs the QUIC listener on an already-bound UDP socket.
@@ -719,6 +790,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
 	defer destinationConn.Close()
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
+	flow.classifier = classifier.New(s.classifierConfig())
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
@@ -786,6 +858,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		"coded_substrate", codedSubstrateFields(substrate, hasCoded),
 		"class", classifier.Class(flow.class.Load())}
 	logFields = append(logFields, codedSubstrateLogFields(substrate, hasCoded)...)
+	logFields = append(logFields, flow.replacementLogFields()...)
 	if !flowComplete && err != nil && !errors.Is(err, context.Canceled) {
 		s.cfg.Logger.Warn("remote flow ended with error", append(logFields, "error", err)...)
 		return
@@ -930,6 +1003,16 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinPrincipalMismatch, session.ResetProtocol, "unknown session")
 		return
 	}
+	// A JOIN that gets this far is the peer's rescue, observable while it is
+	// still only a handshake. If the flow is waiting out a lane-replacement
+	// outage, that grace exists to cover exactly this arrival, so it restarts
+	// here rather than expiring underneath the handshake it was waiting for.
+	// The grace is per outage, so a rescue that dials several JOINs in
+	// parallel extends it once per arriving JOIN, each one fresh evidence.
+	if !serverSession.completed.Load() && serverSession.flow.extendReplacementOutage(time.Now(), laneReplacementWait) {
+		s.metrics.LaneGraceExtended()
+		s.cfg.Logger.Debug("lane replacement grace extended by rescue join", "lane", laneID, "flow_id", open.Header.FlowID)
+	}
 	kind := transportKindForConn(conn)
 	controlReplacement := open.Header.Flags&protocol.FlagReserveControl != 0
 	if controlReplacement && (!serverSession.flow.reserveControlLane || kind != TransportQUIC) {
@@ -975,13 +1058,42 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 	}
 	if err := serverSession.addLane(replacement); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)
-		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinLaneUnavailable, session.ResetFlowLimit, "lane unavailable")
+		switch {
+		case errors.Is(err, errLaneFlowTCPMode):
+			// The flow committed to TCP fallback for the rest of its life, so
+			// a QUIC join can never be admitted. Saying so with the transport
+			// code -- rather than the transient ceiling answer -- lets a new
+			// peer commit to TCP at once instead of retrying an answer that
+			// cannot change.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinLaneUnavailable, session.ResetTransport, "flow switched to TCP fallback")
+		case errors.Is(err, errLaneFlowClosed), errors.Is(err, errLaneDuplicateID):
+			// Both mean this endpoint cannot make the named lane part of the
+			// flow the peer thinks it is joining, and neither heals with a
+			// retry: the same permanent answer "unknown session" already
+			// carries for the refusals above.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinUnknownSession, session.ResetProtocol, "unknown session")
+		default:
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinLaneUnavailable, session.ResetFlowLimit, "lane unavailable")
+		}
 		return
 	}
-	if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
+	// The handshake deadline was cleared above, so the OPEN_OK write needs its
+	// own bound: without one a peer that stops reading wedges the staged lane
+	// in the lane map, where it counts against the admission ceiling yet can
+	// never carry traffic. One path-detection budget matches the rescue-race
+	// window a young staged lane is protected from eviction for. WriteContext
+	// holds the lane's write mutex while it arms the deadline, so a concurrent
+	// control write neither misses nor keeps it.
+	openOK := protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}
+	writeCtx, cancelWrite := context.WithTimeout(ctx, laneJoinAdmissionTimeout)
+	writeErr := fc.WriteContext(writeCtx, openOK)
+	cancelWrite()
+	if writeErr != nil {
+		serverSession.flow.removeLane(replacement)
 		return
 	}
 	if err := serverSession.flow.activateLane(replacement); err != nil {
+		serverSession.flow.removeLane(replacement)
 		return
 	}
 	s.cfg.Logger.Debug("lane joined", "lane", laneID, "transport", kind, "control", controlReplacement, "lanes", serverSession.flow.laneCount())
@@ -1209,4 +1321,16 @@ func transportKindForConn(conn streamConn) TransportKind {
 		return TransportQUIC
 	}
 	return TransportTCP
+}
+
+// classifierConfig is the gateway's flow-classification policy. A gateway
+// serving a datacenter leg has the same reason as its client to stop calling a
+// large request a bulk transfer, and the two ends classify independently, so
+// setting it on only one of them would leave the other demoting flows the first
+// had decided to protect.
+func (s *Server) classifierConfig() classifier.Config {
+	if s.cfg.Profile.Classifier.BulkBytes == 0 {
+		return profile.Default().Classifier
+	}
+	return s.cfg.Profile.Classifier
 }

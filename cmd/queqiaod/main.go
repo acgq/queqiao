@@ -25,6 +25,7 @@ import (
 	"github.com/bojieli/queqiao/internal/netbind"
 	"github.com/bojieli/queqiao/internal/operlog"
 	"github.com/bojieli/queqiao/internal/pep"
+	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -43,7 +44,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("a command is required: provider, enroll, client, service, server, logs, or version")
+		return errors.New("a command is required: provider, enroll, client, service, server, doctor, segments, logs, or version")
 	}
 	switch args[0] {
 	case "version", "--version", "-version":
@@ -60,12 +61,16 @@ func run(args []string) error {
 		return runClient(args[1:])
 	case "server":
 		return runServer(args[1:])
+	case "doctor":
+		return runDoctorCommand(args[1:])
+	case "segments":
+		return runSegmentsCommand(args[1:])
 	case "logs":
 		return runLogs(args[1:])
 	case "service":
 		return runService(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, logs, or version", args[0])
+		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, doctor, segments, logs, or version", args[0])
 	}
 }
 
@@ -235,6 +240,7 @@ func runProvider(args []string) error {
 		state := fs.String("state", "", "provider state directory")
 		user := fs.String("user", "", "user name or ID")
 		expiresIn := fs.Duration("expires-in", 24*time.Hour, "one-time invitation lifetime (maximum 7d)")
+		showQR := fs.Bool("qr", false, "also draw the invitation as a QR code on standard error, for the mobile apps to scan")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -250,9 +256,19 @@ func runProvider(args []string) error {
 			return err
 		}
 		// stdout is intentionally only the importable value, making it safe to
-		// pipe into a QR encoder or provider portal.
+		// pipe into a QR encoder or provider portal. The drawn code goes to
+		// stderr for the same reason: a terminal shows both, a pipe sees one.
+		var qrErr error
+		if *showQR {
+			art, err := renderQRCode(uri)
+			if err != nil {
+				qrErr = err
+			} else {
+				fmt.Fprint(os.Stderr, art)
+			}
+		}
 		fmt.Println(uri)
-		return nil
+		return qrErr
 	case "list-invites":
 		fs := newFlagSet("provider list-invites")
 		state := fs.String("state", "", "provider state directory")
@@ -490,24 +506,32 @@ func runEnroll(args []string) error {
 }
 
 type runtimeOptions struct {
-	listen, localAddress, transport, tcpCongestion, outboundSOCKS5  string
+	listen, localAddress, transport, tcpCongestion, pathProfile     string
 	maxSessions, maxPendingOpens, tcpFallbackLanes                  int
 	chunkSize                                                       int
 	dialTimeout, handshakeTimeout, flowIdleTimeout, flowMaxLifetime time.Duration
 	quicPool, waitForOpenAck, udpOnStream                           bool
-	congestion                                                      string
-	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec     uint64
-	aggregateBytesPerSec, interactiveReserveBytesPerSec             uint64
-	fallbackDelay, fallbackGrace, udpCooldown                       time.Duration
-	udpFailureThreshold                                             int
-	allowPrivate                                                    bool
-	logLevel, logFile, logFormat                                    string
-	jsonLogs                                                        bool
-	logStderr                                                       bool
-	logMaxSizeMiB                                                   int64
-	logMaxBackups                                                   int
-	telemetryLogInterval                                            time.Duration
-	metricsListen                                                   string
+	flowMetadataSocket                                              string
+	classHints                                                      repeatedFlag
+	outboundSOCKS5                                                  string
+	// resolvedProfile is the deployment policy, parsed once at flag time so
+	// that an unknown name fails before anything starts rather than being
+	// silently replaced by the default.
+	resolvedProfile                                             profile.Profile
+	congestion                                                  string
+	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
+	aggregateBytesPerSec, interactiveReserveBytesPerSec         uint64
+	fallbackDelay, fallbackGrace, udpCooldown                   time.Duration
+	udpFailureThreshold                                         int
+	hopPortCount                                                int
+	allowPrivate                                                bool
+	logLevel, logFile, logFormat                                string
+	jsonLogs                                                    bool
+	logStderr                                                   bool
+	logMaxSizeMiB                                               int64
+	logMaxBackups                                               int
+	telemetryLogInterval                                        time.Duration
+	metricsListen                                               string
 }
 
 func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
@@ -524,12 +548,17 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.IntVar(&opts.maxSessions, "max-sessions", defaultMaxSessions, "global concurrent-session limit")
 	fs.IntVar(&opts.chunkSize, "chunk-size", 32*1024, "stream data frame size")
 	fs.DurationVar(&opts.dialTimeout, "dial-timeout", 10*time.Second, "dial timeout")
-	fs.DurationVar(&opts.handshakeTimeout, "handshake-timeout", 10*time.Second, "TLS, protocol, and SOCKS handshake timeout")
+	// 30s, matching the default NewClient applies when nothing is configured:
+	// a first handshake on an erasing path takes about five seconds at 42%
+	// loss, and the flag used to silently override the safer library default
+	// with ten, making that first connection a coin flip.
+	fs.DurationVar(&opts.handshakeTimeout, "handshake-timeout", 30*time.Second, "TLS, protocol, and SOCKS handshake timeout")
 	fs.DurationVar(&opts.flowIdleTimeout, "flow-idle-timeout", 30*time.Minute, "flow idle timeout")
 	fs.DurationVar(&opts.flowMaxLifetime, "flow-max-lifetime", 24*time.Hour, "maximum flow lifetime")
 	fs.StringVar(&opts.transport, "transport", string(pep.TransportAuto), "transport: auto, quic, or tcp")
 	fs.IntVar(&opts.tcpFallbackLanes, "tcp-fallback-lanes", 0, "TCP lanes per bulk flow (0 uses role default)")
 	fs.BoolVar(&opts.udpOnStream, "udp-on-stream", false, "carry UDP packets on streams instead of QUIC datagrams")
+	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
@@ -549,6 +578,9 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.StringVar(&opts.localAddress, "local-address", "auto", "outer source: auto, IP, or if:NAME")
 		fs.IntVar(&opts.maxPendingOpens, "max-pending-opens", 256, "concurrent remote flow opens")
 		fs.BoolVar(&opts.quicPool, "quic-pool", true, "reuse a persistent QUIC connection")
+		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this client runs in: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
+		fs.StringVar(&opts.flowMetadataSocket, "flow-metadata-socket", "", "local capture agent socket to ask what produced each flow, so its class is known before it carries anything; empty disables the lookup")
+		fs.Var(&opts.classHints, "class-hint", "declare the class a flow starts in from what produced it, as <match>=<interactive|bulk>; repeatable, first match wins, and it does nothing without --flow-metadata-socket")
 		fs.BoolVar(&opts.waitForOpenAck, "wait-for-open-ack", false, "wait for destination confirmation before answering SOCKS")
 		fs.DurationVar(&opts.fallbackDelay, "fallback-delay", 300*time.Millisecond, "delay before preparing TCP fallback")
 		fs.DurationVar(&opts.fallbackGrace, "fallback-grace", 2*time.Second, "time a ready TCP fallback waits for QUIC")
@@ -556,9 +588,22 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.DurationVar(&opts.udpCooldown, "udp-cooldown", 30*time.Second, "UDP cooldown after repeated failure")
 	} else {
 		fs.StringVar(&opts.tcpCongestion, "tcp-congestion", "system", "server TCP congestion controller")
+		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this gateway serves: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
 		fs.StringVar(&opts.outboundSOCKS5, "outbound-socks5", "", "optional loopback SOCKS5 upstream for destination traffic")
 	}
+}
+
+// resolveProfile parses the deployment profile once, so an unknown name is a
+// startup failure rather than a silent fallback to a policy the operator did
+// not ask for.
+func resolveProfile(opts *runtimeOptions) error {
+	p, err := profile.ByName(opts.pathProfile)
+	if err != nil {
+		return err
+	}
+	opts.resolvedProfile = p
+	return nil
 }
 
 func validateRuntime(opts runtimeOptions, client bool) error {
@@ -662,6 +707,17 @@ func runClient(args []string) (returnErr error) {
 	if err := requireNoArguments(fs); err != nil {
 		return err
 	}
+	if err := resolveProfile(&opts); err != nil {
+		return err
+	}
+	hints, err := profile.ParseClassHints(opts.classHints)
+	if err != nil {
+		return err
+	}
+	opts.resolvedProfile.ClassHints = hints
+	if len(hints) > 0 && opts.flowMetadataSocket == "" {
+		return errors.New("--class-hint needs --flow-metadata-socket: without an agent to ask, nothing declares a class")
+	}
 	if *profilePath != "" && *providersPath != "" {
 		return errors.New("--profile and --providers are mutually exclusive")
 	}
@@ -746,6 +802,15 @@ func runServer(args []string) (returnErr error) {
 		return err
 	}
 	service := &identity.EnrollmentService{Provider: provider}
+	// An unknown profile name is refused rather than ignored. Starting on a
+	// different policy than the operator asked for is the failure the profile
+	// package exists to prevent, and it would be invisible in the logs.
+	serverProfile, err := profile.ByName(opts.pathProfile)
+	if err != nil {
+		return err
+	}
+	logger.Info("path profile selected", "profile", serverProfile.Name,
+		"level", string(serverProfile.Level), "evidence", serverProfile.Evidence)
 	server, err := pep.NewServer(pep.ServerConfig{
 		ListenAddr: opts.listen, Credentials: provider.ServerCredentials(), Enrollment: service,
 		ChunkSize:        opts.chunkSize,
@@ -758,7 +823,8 @@ func runServer(args []string) (returnErr error) {
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
-		Logger: logger, UDPOnStream: opts.udpOnStream,
+		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
+		HopPortCount: opts.hopPortCount,
 	})
 	if err != nil {
 		return err
@@ -887,6 +953,8 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 			slog.String("local_address", opts.localAddress),
 			slog.Int("max_pending_opens", opts.maxPendingOpens),
 			slog.Bool("quic_pool", opts.quicPool),
+			slog.String("path_profile", opts.resolvedProfile.Name),
+			slog.String("path_profile_level", string(opts.resolvedProfile.Level)),
 			slog.Bool("wait_for_open_ack", opts.waitForOpenAck),
 			slog.Duration("fallback_delay", opts.fallbackDelay),
 			slog.Duration("fallback_grace", opts.fallbackGrace),
@@ -989,10 +1057,9 @@ func logPerformanceSnapshot(logger *slog.Logger, s metrics.Snapshot, interval ti
 		slog.Float64("queqiao_quic_smoothed_rtt_seconds", s.QUICSmoothedRTT.Seconds()),
 		slog.Uint64("queqiao_quic_bytes_sent", s.QUICBytesSent),
 		slog.Uint64("queqiao_quic_bytes_received", s.QUICBytesReceived),
-		slog.Uint64("queqiao_quic_bytes_lost", s.QUICBytesLost),
 		slog.Uint64("queqiao_quic_packets_sent", s.QUICPacketsSent),
 		slog.Uint64("queqiao_quic_packets_received", s.QUICPacketsReceived),
-		slog.Uint64("queqiao_quic_packets_lost", s.QUICPacketsLost),
+		slog.Uint64("queqiao_quic_loss_observed_packets_total", s.QUICLossObservedPackets),
 		slog.Uint64("queqiao_quic_observations_expired_total", s.QUICObservationsExpired),
 		slog.String("queqiao_quic_controller_kind", s.QUICControllerKind),
 		slog.Uint64("queqiao_quic_controller_mode", uint64(s.QUICControllerMode)),
@@ -1012,7 +1079,17 @@ func logPerformanceSnapshot(logger *slog.Logger, s metrics.Snapshot, interval ti
 		slog.Uint64("queqiao_quic_controller_bytes_lost", s.QUICControllerBytesLost),
 		slog.Uint64("queqiao_quic_controller_packets_lost", s.QUICControllerPacketsLost),
 		slog.Float64("queqiao_quic_controller_min_rtt_seconds", s.QUICControllerMinRTT.Seconds()),
-		slog.Float64("queqiao_quic_controller_erasure_floor_ratio", s.QUICControllerErasureFloor),
+		slog.Float64("queqiao_erasure_ratio_send", s.QUICErasureSend),
+		slog.Float64("queqiao_delay_brake_ratio", s.QUICDelayBrake),
+		slog.Uint64("queqiao_quic_sample_mean_bytes_per_second", s.QUICSampleMean),
+		slog.Uint64("queqiao_quic_sample_max_bytes_per_second", s.QUICSampleMax),
+		slog.Uint64("queqiao_quic_sample_max_delivered_bytes", s.QUICSampleDelivered),
+		slog.Float64("queqiao_quic_sample_max_interval_seconds", s.QUICSampleInterval.Seconds()),
+		slog.Uint64("queqiao_coded_symbols_arrived_total", s.QUICCodedSources),
+		slog.Uint64("queqiao_coded_symbols_recovered_total", s.QUICCodedRecovered),
+		slog.Uint64("queqiao_coded_symbols_lost_total", s.QUICCodedLost),
+		slog.Float64("queqiao_erasure_ratio_receive", s.ReceiveErasure()),
+		slog.Float64("queqiao_erasure_residual_ratio_receive", s.ReceiveResidual()),
 		slog.Bool("queqiao_quic_controller_in_recovery", s.QUICControllerInRecovery),
 		// A refused lane join is a peer's flow about to fail. Flat names,
 		// one per reason, matching the labelled /metrics series.
@@ -1025,6 +1102,16 @@ func logPerformanceSnapshot(logger *slog.Logger, s metrics.Snapshot, interval ti
 		slog.Uint64("queqiao_class_transitions_0_total", s.ClassTransitions[0]),
 		slog.Uint64("queqiao_class_transitions_1_total", s.ClassTransitions[1]),
 		slog.Uint64("queqiao_class_transitions_2_total", s.ClassTransitions[2]),
+		// The stall watchdog and its parallel rescue. rescue wins are flat,
+		// one per attempt slot, matching the labelled /metrics series; a win
+		// above slot zero is a sprayed dial beating the established strategy.
+		slog.Uint64("queqiao_flow_stalls_detected_total", s.FlowStallsDetected),
+		slog.Uint64("queqiao_stall_spare_attaches_total", s.StallSpareAttaches),
+		slog.Uint64("queqiao_lane_rescue_attempts_total", s.LaneRescueAttempts),
+		slog.Uint64("queqiao_lane_rescue_wins_0_total", s.LaneRescueWins[0]),
+		slog.Uint64("queqiao_lane_rescue_wins_1_total", s.LaneRescueWins[1]),
+		slog.Uint64("queqiao_lane_rescue_wins_2_total", s.LaneRescueWins[2]),
+		slog.Uint64("queqiao_lane_grace_extensions_total", s.LaneGraceExtensions),
 	)
 }
 
@@ -1091,4 +1178,15 @@ func serveMetrics(addr string, handler http.Handler, logger *slog.Logger) (func(
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	}, nil
+}
+
+// repeatedFlag collects a flag given more than once, in the order it was
+// given, because for class hints that order is the policy: first match wins.
+type repeatedFlag []string
+
+func (r *repeatedFlag) String() string { return strings.Join(*r, ",") }
+
+func (r *repeatedFlag) Set(v string) error {
+	*r = append(*r, v)
+	return nil
 }

@@ -4,7 +4,7 @@
 > **Release level:** Public-preview source tree; no production-ready claim
 >
 > **Wire protocol:** Version 1 only; incompatible versions fail closed
-> **Last reviewed:** 2026-08-23
+> **Last reviewed:** 2026-08-26
 
 Queqiao is ready to use for its supported paired-gateway topology, from the
 binaries published with every release or from source. It is not a universal acceleration layer and it does not promise the
@@ -35,7 +35,7 @@ limitations](KNOWN-LIMITATIONS.md) before deploying it.
 
 | Area | Current capability |
 | --- | --- |
-| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback; optional gateway chaining through a loopback SOCKS5 upstream |
+| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback |
 | WAN policy | shared endpoint-pair path model, erasure-aware control, aggregate pacing, and interactive reserve |
 | Recovery | byte-offset reassembly, range acknowledgements, bounded replay, sliding-window coding, lane replacement, and UDP relay reclamation |
 | Contention | behavioral flow state, priority queues, reactive bulk isolation, and bounded opt-in TCP fallback striping |
@@ -43,6 +43,7 @@ limitations](KNOWN-LIMITATIONS.md) before deploying it.
 | Operations | bounded JSON logs, metrics, local visualizer, service examples, release packaging, SBOMs, and rollback procedure |
 | Clients | one process per provider or one process serving several providers on separate loopback SOCKS5 listeners; macOS/Linux desktop and gateway binaries published with every release; Windows targets built but under testing; Android SOCKS export and iOS packet-tunnel clients under testing, all using the protocol-1 core |
 | Conformance | committed protocol-1 vectors for framing, acknowledgement, destinations, UDP, coding, and enrollment, replayed by the test suite |
+| Profiles | `wan-shared-bottleneck` is the default and is what the qualification above refers to; `dc-long-haul` is experimental, covering a long hop between two regions one operator runs, and is qualified on one path |
 
 ## Evidence and open work
 
@@ -57,9 +58,13 @@ The current evidence boundary is:
 - no complete, public protocol-1 multi-network candidate report is recorded;
 - the required residential, mobile, managed-network, second-egress, and
   24–72-hour soak matrix is incomplete;
-- independent transport, security, and mobile reviews remain open; and
+- independent transport, security, and mobile reviews remain open;
 - historical throughput figures are design evidence, not a current performance
-  promise.
+  promise; and
+- the `dc-long-haul` profile has one path behind it. Its measurements are
+  recorded in [PATH-CHARACTER-DC-20260826.md](PATH-CHARACTER-DC-20260826.md),
+  including the cases where a client-side fix beats it, and it stays
+  experimental until a second path is measured.
 
 The [field-validation matrix](FIELD-VALIDATION.md), [release checklist](RELEASE-CHECKLIST.md),
 and [production design criteria](PRODUCTION-DESIGN.md) define the gates rather

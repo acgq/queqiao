@@ -3,10 +3,8 @@ package pep
 import (
 	"context"
 	"encoding/binary"
-	"io"
 	"log/slog"
 	"net"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -179,17 +177,14 @@ func TestARescuedUDPAssociationKeepsItsRemoteSourceAddress(t *testing.T) {
 	}
 
 	tlsCert, roots := testCertificate(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tcpListener.Close()
-	tcpPort := tcpListener.Addr().(*net.TCPAddr).Port
-	quicPacketConn, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpPort)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	var trace progressTestLog
+	logger := slog.New(slog.NewTextHandler(&trace, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("UDP rescue trace:\n%s", trace.String())
+		}
+	})
+	tcpListener, quicPacketConn := listenTCPAndUDPOnOnePort(t)
 	serverAddr := tcpListener.Addr().String()
 	server, err := NewServer(ServerConfig{
 		ListenAddr: serverAddr, Credentials: tlsCert,
@@ -215,7 +210,6 @@ func TestARescuedUDPAssociationKeepsItsRemoteSourceAddress(t *testing.T) {
 	defer serviceCancel()
 	quicCtx, quicCancel := context.WithCancel(serviceCtx)
 	errorsCh := make(chan error, 3)
-	go func() { errorsCh <- server.ServeListener(serviceCtx, tcpListener) }()
 	go func() { errorsCh <- server.ServePacketConn(quicCtx, quicPacketConn) }()
 	go func() { errorsCh <- client.ServeListener(serviceCtx, clientListener) }()
 
@@ -266,6 +260,10 @@ func TestARescuedUDPAssociationKeepsItsRemoteSourceAddress(t *testing.T) {
 	// TLS/TCP, which is a different transport to the same server -- so the
 	// relay it reclaims is genuinely the retained one and not an artefact of
 	// the connection surviving.
+	// Start TCP only after the initial QUIC exchange is proved. Under race
+	// instrumentation or host load, an AUTO dial can otherwise choose TCP
+	// before the fault, making cancellation of QUIC a meaningless test.
+	go func() { errorsCh <- server.ServeListener(serviceCtx, tcpListener) }()
 	quicCancel()
 	deadline := time.Now().Add(10 * time.Second)
 	for client.Metrics().Snapshot().UDPAssociationReconnects == 0 && time.Now().Before(deadline) {

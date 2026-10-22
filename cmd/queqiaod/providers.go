@@ -197,10 +197,13 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
-		Budget:        budget,
-		FallbackDelay: opts.fallbackDelay, FallbackGrace: opts.fallbackGrace,
+		Profile:            opts.resolvedProfile,
+		FlowMetadataSocket: opts.flowMetadataSocket,
+		Budget:             budget,
+		FallbackDelay:      opts.fallbackDelay, FallbackGrace: opts.fallbackGrace,
 		UDPFailureThreshold: opts.udpFailureThreshold, UDPCooldown: opts.udpCooldown,
-		Metrics: registry, Logger: logger,
+		HopPortCount: profile.HopPortCount,
+		Metrics:      registry, Logger: logger,
 	})
 }
 

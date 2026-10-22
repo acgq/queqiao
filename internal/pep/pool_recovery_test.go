@@ -71,6 +71,11 @@ func TestPooledFlowsRecoverThroughOneReplacementGeneration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// This test pins exact dial counts for the recovery it injects.
+			// On a slow runner the stall watchdog would start rounds of its
+			// own -- a slow echo is a real stall to it -- and each of those
+			// rounds opens two sprayed dials the ceiling does not budget for.
+			client.disableStallWatchdogForTest = true
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -135,8 +140,16 @@ func TestPooledFlowsRecoverThroughOneReplacementGeneration(t *testing.T) {
 			if t.Failed() {
 				return
 			}
-			if got := udpSockets.Load(); got != baselineSockets+1 {
-				t.Fatalf("generation recovery opened %d new UDP sockets, want one", got-baselineSockets)
+			if got := udpSockets.Load(); got < baselineSockets+1 {
+				t.Fatalf("generation recovery opened %d new UDP sockets, want at least one", got-baselineSockets)
+			} else if want := baselineSockets + 1 + 2*flowCount; got > want {
+				// The replacement generation dial is still singleflight --
+				// one new socket however many flows wait on it, which is what
+				// the old exact assertion pinned. Each flow's rescue round
+				// now also runs two independent sprayed QUIC dials beside it
+				// (first JOIN wins, the losers are cancelled), so the ceiling
+				// is one coalesced generation dial plus two racers per flow.
+				t.Fatalf("generation recovery opened %d new UDP sockets, want the coalesced dial plus at most two racers per flow (%d)", got-baselineSockets, want-baselineSockets)
 			}
 			snapshot := client.Metrics().Snapshot()
 			if snapshot.LaneReplacements != flowCount {
@@ -372,6 +385,99 @@ func TestControlPoolDialOwnershipAndGenerationGuards(t *testing.T) {
 				t.Fatal("server shutdown timeout")
 			}
 		})
+	}
+}
+
+func TestTimedOutControlStreamRetiresItsQUICGeneration(t *testing.T) {
+	certificate, roots := testCertificate(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetConn.Close()
+	server, err := NewServer(ServerConfig{
+		ListenAddr: packetConn.LocalAddr().String(), Credentials: certificate,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
+		EnableQUIC:        true, Logger: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.ServePacketConn(ctx, packetConn) }()
+
+	var sockets atomic.Int64
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: packetConn.LocalAddr().String(),
+		LocalAddress: "127.0.0.1", Credentials: roots,
+		Transport: TransportQUIC, EnableQUICPool: true,
+		DialTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
+		Logger: logger,
+		SocketControl: func(network, _ string, _ syscall.RawConn) error {
+			if strings.HasPrefix(network, "udp") {
+				sockets.Add(1)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPooled, ok := first.(*controlPoolStreamConn)
+	if !ok {
+		t.Fatalf("pooled lane type = %T", first)
+	}
+	firstGeneration := firstPooled.generation
+	firstPooled.transportFailed(io.EOF)
+	client.quicMu.Lock()
+	afterEOF := client.quicGeneration
+	client.quicMu.Unlock()
+	if afterEOF != firstGeneration {
+		t.Fatal("ordinary stream EOF retired a healthy pooled generation")
+	}
+
+	firstPooled.transportFailed(context.DeadlineExceeded)
+	client.quicMu.Lock()
+	afterTimeout := client.quicGeneration
+	client.quicMu.Unlock()
+	if afterTimeout != nil {
+		t.Fatal("timed-out stream left its pooled generation reusable")
+	}
+	_ = first.Close()
+
+	second, err := client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	secondPooled, ok := second.(*controlPoolStreamConn)
+	if !ok {
+		t.Fatalf("replacement pooled lane type = %T", second)
+	}
+	if secondPooled.generation == firstGeneration {
+		t.Fatal("next lane reused the timed-out QUIC generation")
+	}
+	if got := sockets.Load(); got != 2 {
+		t.Fatalf("UDP sockets = %d, want one replacement generation", got)
+	}
+
+	client.closeQUICPool()
+	cancel()
+	select {
+	case serveErr := <-serverErr:
+		if serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+			t.Fatalf("server shutdown: %v", serveErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server shutdown timeout")
 	}
 }
 

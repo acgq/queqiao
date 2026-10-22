@@ -4,7 +4,7 @@
 > **Status:** Current implementation reference
 >
 > **Applies to:** Public protocol 1
-> **Last reviewed:** 2026-08-23
+> **Last reviewed:** 2026-08-20
 
 This document describes the implementation behind the [How it works](../README.md#how-it-works)
 overview. Queqiao is a paired WAN optimization system: a client accepts local SOCKS5
@@ -48,8 +48,7 @@ provider admin CLI ── atomic authorization state ─────────
 application → SOCKS5 → unified client data path → TLS 1.3 → gateway → destination
                          │                   │                  │
                          │                   ├─ QUIC/UDP        ├─ destination policy
-                         │                   └─ TLS/TCP         ├─ UDP relay store
-                         │                                      └─ optional loopback SOCKS5 upstream
+                         │                   └─ TLS/TCP         └─ UDP relay store
                          │
                          ├─ endpoint-pair path model
                          ├─ aggregate pacing and priority
@@ -177,6 +176,28 @@ Carrier recovery attaches a new lane with JOIN. Unacknowledged byte ranges and
 close state are replayed on the replacement. A QUIC flow has one data connection
 at a time; temporary old/new lanes exist only for bounded handoff state.
 
+Lane readers process ordinary ACKs independently of application delivery. If
+that delivery fills the event channel, a bounded, memory-accounted overflow
+queue lets the reader reach ACKs later on the same stream. Overflow beyond the
+receive profile fails the flow explicitly. Duplicate DATA repeats ACK state;
+a new lane receives current ACK state even if the previous write succeeded.
+Only acknowledgements of new bytes reset the delivery-progress timer.
+
+Outstanding outbound work has a single 45-second no-progress budget across
+rescue attempts. A blocked application write also has a 45-second budget,
+renewed on partial writes. Quiet connections with no outstanding data are not
+subject to these budgets. Frame-write deadlines include waiting for another
+writer. These are local implementation policies; the protocol-1 wire format
+is unchanged.
+
+Stall rescues are paced by the RTT-based detector without an additional
+exponential retry delay. In AUTO, a completed QUIC rescue race that encounters
+a lane-capacity refusal can immediately attempt TCP. A locally suspected lane
+can be replaced at the ceiling without the normal young-lane protection;
+healthy racing JOINs retain that protection. Stall rescues wait for initial
+OPEN confirmation so they cannot overtake admission of an optimistic flow.
+Remote RESET and full-close cancellation bypass application delivery queues.
+
 In automatic mode, QUIC is preferred and TLS/TCP is a delayed fallback. Only
 differential path evidence—QUIC failing while authenticated TCP reaches the
 same endpoint—marks UDP unavailable. Once a flow hands off to TCP, it does not
@@ -190,6 +211,12 @@ claim that multiple connections increase a fixed shared bottleneck.
 
 ## UDP associations
 
+A retained UDP relay socket is published for resumption only after its old
+packet reader has stopped. Cancellation interrupts that reader's socket wait
+and joins it before ownership transfers, so an old association cannot consume
+replies intended for the replacement.
+
+
 SOCKS5 UDP ASSOCIATE opens one authenticated logical association. PACKET frames
 preserve each datagram boundary and carry a canonical destination. A 64-packet
 window drops duplicates and stale replays while accepting ordinary gaps and
@@ -200,17 +227,6 @@ under a random single-use token. A replacement association with both the token
 and the same authenticated device principal can reclaim it, preserving the
 source address seen by the destination. At most 256 relays are retained.
 Datagrams in flight during failure are not recovered.
-
-The gateway normally opens TCP and UDP destinations directly. An operator may
-instead configure one unauthenticated loopback SOCKS5 upstream. TCP flows use
-CONNECT and UDP associations use UDP ASSOCIATE; the latter's TCP control
-connection is retained as part of the bounded relay so lane recovery does not
-silently destroy the upstream association. Destination policy first resolves
-and validates every current address, then preserves the original domain in the
-SOCKS request so the trusted local router can apply domain rules. The router's
-final DNS resolution is therefore part of the operator-controlled trust
-boundary. This is a local egress integration point, not another Queqiao carrier
-or a wire-protocol feature.
 
 ## Trust boundaries
 

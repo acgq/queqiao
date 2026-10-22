@@ -2,13 +2,67 @@
 
 > [!NOTE]
 > **Status:** Current limitations for public protocol 1
-> **Last reviewed:** 2026-08-23
+> **Last reviewed:** 2026-08-26
 
 These are the boundaries of the ready-to-use public-preview deployment. Read
 them before treating a successful local test as evidence that a different
 network will behave the same way. The [project status](STATUS.md) tracks which
 qualification items are still open.
 
+- Connection recovery cannot promise success when every path is unavailable.
+  Outstanding tunnel bytes that make no acknowledgement progress for 45 seconds
+  fail explicitly, as do application writes that make no progress for 45
+  seconds. An intentionally paused consumer can therefore lose a connection
+  if it leaves data outstanding for that long; an idle connection is unaffected.
+  Protocol 1 has no explicit receiver-credit/pause message, so the remote sender
+  cannot fully distinguish consumer backpressure from a failed delivery path.
+- Control and DATA can still share a reliable transport stream. The bounded
+  ingress backlog prevents a full application event channel from blocking the
+  reader, but cannot bypass bytes missing within the underlying TCP/QUIC stream.
+  Byte-stream order also means a missing logical byte range holds up later
+  application data until recovery fills it. Backlog exhaustion is an explicit
+  flow error, not unlimited buffering or silent data loss.
+- The congestion control described in [the control
+  redesign](CONTROL-REDESIGN.md) has no brake on a policed path. A policer
+  drops what it cannot pass and holds nothing, so it produces loss and no
+  delay -- and that design uses delay as its congestion signal and no longer
+  treats loss as one. Measured against an emulated policer shaped to 250 KB/s,
+  a sender reaches 2.4 times the path's capacity at 36% loss with the brake
+  reading zero throughout. The live path this project targets is a policer, so
+  this is the ordinary case rather than an edge one.
+
+  This is shipping. It is the controller in the release, not a proposal, and
+  the honest summary is that a policed path is less overdriven than it was
+  during this work and is still overdriven: 42 times the path became 7.3 and
+  then 2.4, each step a separate fault found by measuring rather than by
+  reasoning. The bandwidth estimate turned out not to be one of them -- driven
+  in isolation it reads within one per cent of a policer's rate -- and the two
+  that were are an erasure compensation that fed itself and an all-time peak
+  bandwidth that was re-seeded faster than the filter could retire it. What a
+  policed path does not yet have is a signal that stops the remaining
+  overdrive, and the transport will keep pushing into one until it does.
+
+  `internal/pep/case4_test.go` asserts this behaviour rather than the fix, so
+  it cannot change silently in either direction, and the redesign document
+  records what was tried, in what order, and which of it was wrong. It has since
+  earned that design twice: a change letting a sender release a burst when
+  neither brake reported anything took the same emulated policer from 3.0x to
+  4.0x and its loss from 32.9% to 54.9%, because on a policer neither brake
+  reports anything by construction. The burst is now also gated on the sending
+  direction being close to lossless, which is a guard against the blind spot
+  rather than a fix for it.
+- The `dc-long-haul` profile is qualified on exactly one path. Everything known
+  about it comes from a Guiyang-to-Irvine link, so its constants are that
+  link's constants until a second path either confirms them or doesn't. It is
+  marked experimental for that reason and the marking is not a formality.
+- On a path direction that does not erase, a fully tuned client reaches the same
+  median as this transport. Reusing a connection and setting
+  `net.ipv4.tcp_slow_start_after_idle=0` took a real 355KB inference upload to
+  240.9ms, against 236.5ms through the tunnel in the same minutes. Do the free
+  fixes: they cost a config line and they get you there. What they do not reach
+  is a connection that is genuinely cold, a direction that erases, or a caller
+  you cannot reconfigure. See
+  [DEPLOYING-DC-PROFILE.md](DEPLOYING-DC-PROFILE.md).
 - Queqiao is a WAN optimization data plane, not an anonymity network. The
   desktop ingress is SOCKS5, the released Android app exports an authenticated
   SOCKS5 endpoint to a separate routing client, and the iOS app is a
@@ -53,12 +107,6 @@ qualification items are still open.
   cannot recover datagrams in flight during path failure.
 - Automatic TCP fallback cannot bypass a network that blocks both transports
   or the selected gateway port.
-- The optional gateway SOCKS5 upstream is unauthenticated and loopback-only.
-  Queqiao validates the gateway's current DNS answers and then preserves the
-  original domain for upstream routing, so the trusted upstream's final DNS
-  answer is a second resolution outside that initial check. The upstream must
-  support UDP ASSOCIATE for UDP traffic, and there is no silent direct
-  fallback.
 - `--allow-private-destinations` removes the default SSRF boundary and should
   be used only for an intentional private-access service.
 - The desktop SOCKS listener is intentionally loopback-only and has no remote
@@ -66,7 +114,7 @@ qualification items are still open.
   exposing it directly to a LAN or public network.
 - A trust-root/issuer compromise requires creating a new provider state and
   re-enrolling users; device revocation is insufficient.
-- The released Android app is not a VPN and has no routing engine. It exports
+- Android export mode is not a VPN and has no routing engine. It exports
   an authenticated SOCKS5 endpoint on loopback, and the consumer client that
   owns the device tunnel supplies rules, per-app policy, and DNS. That client
   must exclude Queqiao's package from its tunnel; if it does not, Queqiao's own
@@ -76,25 +124,47 @@ qualification items are still open.
   cause in the notification and in the connection test, and never blocks a
   connection, because a VPN carrying Queqiao's uplink is not by itself proof of
   a loop.
-- The iOS client is a full-device tunnel with a bounded routing subset, not a
-  rule engine. It offers typed CIDR bypass, an experimental bundled registry
-  set, and automatic connection rules; it does not offer per-app routing,
-  domain or process rules, or custom DNS. DNS uses Cloudflare through the
-  encrypted Queqiao tunnel.
-- The iOS bundled China route set matches addresses, not names. DNS resolves
-  through the tunnel, so a Chinese domain resolved from the gateway's vantage
-  point can return addresses outside the set and still route through Queqiao.
-  The registry also delegates address space that need not be in use. The
-  feature is therefore experimental and off by default.
+- The Android full tunnel edits routing only while disconnected, and a change
+  applies at the next connect: Android cannot re-plumb an established
+  `VpnService` interface the way iOS replaces its network settings. Its
+  bundled Chinese address set installs as routes on Android 13 and later only,
+  because earlier releases cannot exclude a route; a `GEOIP,CN,DIRECT` rule
+  keeps the same addresses direct there.
+- The iOS client and the Android full tunnel carry a routing rule list: `DOMAIN`,
+  `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, `GEOIP` and `DST-PORT` rules
+  choosing between `PROXY`, `DIRECT` and `REJECT`, first match wins, in the
+  syntax Clash, mihomo, sing-box and Shadowrocket read. A flow no rule matches
+  takes the tunnel. It does not offer per-app routing, process rules,
+  `URL-REGEX` or `USER-AGENT` matching, remote rule-set subscriptions, or a
+  choice of outbound: there is one tunnel, so a rule naming a proxy group is
+  refused rather than read as `PROXY`.
+- Name rules work by the core answering lookups itself, from `198.18.0.0/15`,
+  and reversing the handle when the connection arrives. Two consequences are
+  worth knowing. An application that ignores the tunnel's resolver and speaks
+  DNS-over-HTTPS to a server of its own never asks, so its flows arrive as
+  literal addresses and only the address rules can see them. And the handles
+  live for as long as the tunnel does: a name evicted from a full map ends the
+  flows still using it rather than misrouting them, which is a reset the
+  application sees rather than traffic going somewhere it should not.
+- `DIRECT` flows are resolved on the device, which is the point of matching
+  `DIRECT`; proxied flows are resolved by the gateway, which is the vantage
+  they are being sent to use. Queries that are not answered locally still go
+  to Cloudflare through the encrypted tunnel.
+- The iOS bundled China route set matches addresses, not names, and the
+  registry delegates address space that need not be in use. The "keep Chinese
+  addresses direct" toggle is therefore still experimental and still off by
+  default. What it could never do on its own was follow a Chinese domain that
+  answers with a CDN address outside the registry set; a `DOMAIN-SUFFIX` rule
+  can, which is why the bundled China preset pairs name rules with `GEOIP,CN`
+  rather than relying on either alone.
 - iOS automatic connection rules match Wi-Fi networks by typed name. Queqiao
   never scans, so a network the user has not named is treated as untrusted, and
   a renamed network stops matching until the user updates the list.
-- Android always-on VPN is not offered at all by the released app, which
-  declares no `VpnService`. The debug tunnel keeps it disabled pending
+- Android always-on VPN is declined by the full tunnel pending
   physical-device locked boot and restart qualification.
 - Apple App Store VPN publication requires an organization developer account
   under current store rules, so iOS is source-build/self-sign only. Google
-  Play's Organization requirement is scoped to apps approved to use
-  `VpnService`, which the released Android app is not; that removes one named
-  blocker but is not a guarantee of publication, and direct distribution
+  Play's Organization requirement applies to apps approved to use
+  `VpnService`, which the released Android app now is, so a Play listing needs
+  an Organization account and Play's VPN declaration; direct distribution
   remains the supported Android path.

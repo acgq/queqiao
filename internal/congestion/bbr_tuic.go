@@ -19,9 +19,21 @@ import (
 // per packet. ACK receive timestamps are used when the QUIC fork supplies them
 // and the congestion-event time otherwise.
 type TUICBBRSender struct {
-	rttStats        quiccongestion.RTTStatsProvider
-	maxDatagramSize quiccongestion.ByteCount
-	pacer           *pacer
+	rttStats quiccongestion.RTTStatsProvider
+	// lossIsCongestion decides whether a loss may put this sender into
+	// recovery. It is true for a sender used on its own, which is TUIC's
+	// behaviour and what the benchmark reference must keep. ErasureSender
+	// clears it: on a path that erases packets for reasons unrelated to the
+	// sending rate, a controller that reads every loss as congestion gives the
+	// path away, and the brake is the delay bound instead.
+	//
+	// Losses still reach this method either way. They have to: bytesInFlight
+	// below is priorInFlight less what was acknowledged and what was lost, so
+	// a sender that is not told about a loss believes the pipe is fuller than
+	// it is and throttles itself for a packet that is already gone.
+	lossIsCongestion bool
+	maxDatagramSize  quiccongestion.ByteCount
+	pacer            *pacer
 
 	mode                 tuicBbrMode
 	pacingGain           float64
@@ -52,7 +64,11 @@ type TUICBBRSender struct {
 	lastSampleAppLimited bool
 	// peakBandwidth is the most this connection has ever been measured to
 	// deliver, which outlives the filter's ten-round memory of it.
-	peakBandwidth     uint64
+	peakBandwidth uint64
+	// peakBandwidthAt is when peakBandwidth was observed. Without it the peak
+	// is an all-time maximum, and restartFromIdle puts an all-time maximum
+	// back into a filter whose whole purpose is to forget.
+	peakBandwidthAt   monotime.Time
 	lossEventsInRound uint64
 	bytesLostInRound  uint64
 
@@ -143,16 +159,19 @@ func NewTUICBBRSender(initialPacketSize quiccongestion.ByteCount) *TUICBBRSender
 		// TUIC uses a 2.0 congestion-window gain in STARTUP.  The pacing gain
 		// remains highGain; applying that factor to cwnd as well overfills the
 		// initial flight before a delivery model exists.
-		cwndGain:      tuicCwndGain,
-		highCwndGain:  tuicCwndGain,
-		maxAckedPN:    quiccongestion.PacketNumber(-1),
-		maxSentPN:     quiccongestion.PacketNumber(-1),
-		endRecoveryPN: quiccongestion.PacketNumber(-1),
-		roundEndPN:    quiccongestion.PacketNumber(-1),
-		estimator:     newTUICBandwidthEstimator(),
-		ackAgg:        tuicAckAggregation{maxAckHeight: newTUICMinMax()},
-		randomState:   uint64(monotime.Now()) ^ uint64(initialPacketSize)<<17,
-		telemetry:     newTelemetryState("bbr-tuic"),
+		cwndGain:     tuicCwndGain,
+		highCwndGain: tuicCwndGain,
+		// A sender used on its own keeps TUIC's behaviour, which is what the
+		// benchmark reference and every non-erasure path expect.
+		lossIsCongestion: true,
+		maxAckedPN:       quiccongestion.PacketNumber(-1),
+		maxSentPN:        quiccongestion.PacketNumber(-1),
+		endRecoveryPN:    quiccongestion.PacketNumber(-1),
+		roundEndPN:       quiccongestion.PacketNumber(-1),
+		estimator:        newTUICBandwidthEstimator(),
+		ackAgg:           tuicAckAggregation{maxAckHeight: newTUICMinMax()},
+		randomState:      uint64(monotime.Now()) ^ uint64(initialPacketSize)<<17,
+		telemetry:        newTelemetryState("bbr-tuic"),
 	}
 	b.pacer = newTUICPacer(b.bandwidth)
 	b.publishTelemetry()
@@ -257,7 +276,13 @@ func (b *TUICBBRSender) seedBandwidth(rate uint64, roundTrip time.Duration) {
 	if rate > tuicMaxRate {
 		rate = tuicMaxRate
 	}
-	b.estimator.maxFilter.updateMax(b.round, rate)
+	// The seed is stamped with the current time like any other sample, so a
+	// lane that inherits a rate and then goes quiet lets it expire rather than
+	// pacing from another lane's peak indefinitely.
+	if roundTrip > 0 {
+		b.estimator.maxFilter.setRoundTrip(roundTrip)
+	}
+	b.estimator.maxFilter.updateMax(b.round, monotime.Now(), rate)
 	if pacing := uint64(float64(rate) * b.highGain); pacing > b.pacingRate {
 		b.pacingRate = minUint64(pacing, tuicMaxRate)
 	}
@@ -296,10 +321,33 @@ func (b *TUICBBRSender) minRoundTrip() time.Duration { return b.minRTT }
 // disproves it within ten rounds, which is what the filter is for -- where
 // being wrong the other way costs nineteen seconds every time a connection is
 // reused, which is exactly what pooling connections is meant to make cheap.
-func (b *TUICBBRSender) restartFromIdle() {
-	if b.peakBandwidth > b.estimator.estimate() {
-		b.seedBandwidth(b.peakBandwidth, b.minRTT)
+func (b *TUICBBRSender) restartFromIdle(now monotime.Time) {
+	if b.peakBandwidth <= b.estimator.estimate() {
+		return
 	}
+	// A peak the filter would already have dropped must not be put back.
+	//
+	// The bet above -- that a path which delivered 12 Mbit/s a minute ago still
+	// does -- is only safe because "the filter's own window disproves it within
+	// ten rounds". It cannot. This fires whenever the pipe empties, which on a
+	// connection that is application limited essentially always is constantly,
+	// so the peak is re-armed faster than any window can retire it. Measured on
+	// a live gateway, the estimate stood at four times the widest delivery
+	// sample the connection had ever taken -- arithmetically impossible for a
+	// maximum over samples, and the proof that this path was supplying it.
+	//
+	// Bounding it by the filter's own window is what makes the sentence above
+	// true rather than aspirational: a seed is a hypothesis about the path
+	// standing in for a measurement, so it expires when a measurement of that
+	// age would have.
+	//
+	// The alternative, the filter's ten-second ceiling, was measured and is
+	// worse: it costs the same on an erasure channel and leaves the policed
+	// path at 9.5 times its capacity where this leaves it at 2.4.
+	if b.estimator.maxFilter.expired(tuicMinMaxSample{at: b.peakBandwidthAt, value: b.peakBandwidth}, now) {
+		return
+	}
+	b.seedBandwidth(b.peakBandwidth, b.minRTT)
 }
 
 func (b *TUICBBRSender) initialPacingRate() uint64 {
@@ -340,7 +388,7 @@ func (b *TUICBBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 	preSendFlight := preSendBytesInFlight(bytesInFlight, bytes, retransmittable)
 	if preSendFlight == 0 {
 		b.exitingQuiescence = true
-		b.restartFromIdle()
+		b.restartFromIdle(sentTime)
 	}
 	// Keep the controller telemetry in the same post-send units as quic-go.
 	b.bytesInFlight = maxByteCount(0, bytesInFlight)
@@ -431,7 +479,7 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	// updates sampler/loss accounting, but waits for an ACK-clocked event before
 	// entering or advancing packet conservation.
 	if len(acked) != 0 {
-		b.updateRecoveryState(largestAck, hasLosses, isRoundStart)
+		b.updateRecoveryState(largestAck, hasLosses && b.lossIsCongestion, isRoundStart)
 	}
 	// Process the complete ACK batch as one sample. quic-go gives every packet
 	// in this callback the same receive/event time; updating the estimator once
@@ -472,7 +520,7 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	// memory of it, so that a pipe which empties can be refilled from what it
 	// already knows rather than from what a trickle left behind.
 	if bw := b.estimator.estimate(); bw > b.peakBandwidth {
-		b.peakBandwidth = bw
+		b.peakBandwidth, b.peakBandwidthAt = bw, eventTime
 	}
 	lastSendState := sample.lastSendState
 	if lastLostState.valid && (!lastSendState.valid || lastLostState.packetNumber > lastSendState.packetNumber) {
@@ -959,6 +1007,8 @@ func (b *TUICBBRSender) publishTelemetry() {
 		b.estimator.zeroSamples,
 		b.round,
 	)
+	_, mean, max, delivered, interval := b.estimator.sampleSummary()
+	b.telemetry.updateSampleShape(mean, max, delivered, interval)
 }
 
 func (b *TUICBBRSender) Telemetry() ControllerTelemetry { return b.telemetry.snapshot() }
@@ -986,6 +1036,10 @@ func (a *tuicAckAggregation) update(newlyAcked uint64, now monotime.Time, round,
 	}
 	a.epochBytes = satAddUint64(a.epochBytes, newlyAcked)
 	diff := a.epochBytes - expected
-	a.maxAckHeight.updateMax(round, diff)
+	// The ack-aggregation filter keeps the original round-only clock: it
+	// measures how much more than expected one round delivered, which is a
+	// statement about rounds and means nothing between them. A zero time
+	// leaves it exactly as it was.
+	a.maxAckHeight.updateMax(round, monotime.Time(0), diff)
 	return diff
 }

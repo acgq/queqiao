@@ -50,10 +50,26 @@ const (
 	// the combined queues at maxLaneWriteQueue.
 	maxLaneInteractiveReserve = 8
 	maxLaneBulkQueue          = maxLaneWriteQueue - maxLaneInteractiveReserve
-	// Must exceed QUIC dead-path detection plus TCP handshake time. The
-	// client normally detects a blackhole at ~15 s, then needs one scheduler
-	// tick and a bounded TCP handshake before the replacement can arrive.
-	laneReplacementWait = 45 * time.Second
+	// laneDeadPathDetection is how long QUIC spends deciding that a silent
+	// lane is dead: it is the MaxIdleTimeout every lane is configured with in
+	// quicConfig, named here because the replacement grace below is derived
+	// from it. The two are one budget in two halves, not two independent
+	// constants -- a flow cannot be given a replacement grace shorter than the
+	// time its peer needs to notice there is anything to replace, so raising
+	// the detection budget raises the grace with it.
+	laneDeadPathDetection = 15 * time.Second
+	// laneRescueHandshake is what a replacement lane still needs after the
+	// peer has noticed: one scheduler tick, and a bounded handshake on a path
+	// that has just proved hostile enough to kill a lane.
+	laneRescueHandshake = 30 * time.Second
+	// laneReplacementWait is the whole budget a flow spends with no healthy
+	// lane before it gives up. It is spent per outage rather than per wait:
+	// several call sites wait for the same missing lane, and each used to
+	// start its own copy of this grace, so a flow that was never going to be
+	// rescued burned the budget once per waiter. On the live gateway that was
+	// visible as failures clustered at 76-106 s -- two graces, not one -- for
+	// flows that had done their work in the first second. See issue #53.
+	laneReplacementWait = laneDeadPathDetection + laneRescueHandshake
 	// Once both FIN directions are observed, no additional application bytes
 	// can be delivered. This grace lets a healthy final ACK arrive, but bounds
 	// retention when the peer closes its last lane at exactly that point.
@@ -117,8 +133,9 @@ type mpLane struct {
 	cwndBytes     int
 	inFlightBytes int
 	cwndSampled   time.Time
-	// admitted is when this lane joined the flow, which is what bounds the
-	// handover of bulk traffic off the shared control lane.
+	// admitted is when this lane joined the flow. It bounds eviction at the
+	// lane ceiling: a lane younger than the rescue-race window may still be
+	// waiting on the peer's crowning decision, so it is never the victim.
 	admitted          time.Time
 	writeInteractiveQ chan laneFrame
 	writeSlots        chan struct{}
@@ -126,6 +143,12 @@ type mpLane struct {
 	closed            atomic.Bool
 	sent              atomic.Uint64
 	recv              atomic.Uint64
+	// suspected is the flow-stall watchdog's demotion mark: the lane is
+	// believed to be carrying nothing useful, so it is passed over for new
+	// writes while a healthier lane exists. It is never closed for this --
+	// it keeps receiving, and an acknowledgement arriving on it clears the
+	// mark, because that is direct proof the lane still round-trips.
+	suspected atomic.Bool
 	// rateMu guards a short-lived cache of the lane's transport statistics.
 	// Reading them from QUIC on every frame would take the connection lock on
 	// the hot path for information that changes on an RTT timescale.
@@ -232,6 +255,12 @@ type multipathFlow struct {
 	// does not know this session. That answer is permanent, so it ends the
 	// replacement grace rather than being retried.
 	resumeRefused atomic.Bool
+	// capacityRefusals counts consecutive rescue rounds the peer answered
+	// with its lane-admission ceiling. One answer is the ordinary loser of a
+	// rescue race; several in a row with no successful round between them are
+	// the signature of a wedged admission slot the peer cannot see, which is
+	// when the answer stops being treated as transient.
+	capacityRefusals atomic.Int64
 	// replacementAbandoned records that whatever opens replacement lanes for
 	// this flow has stopped: its attempt budget is spent, or its manager has
 	// returned. The grace exists to cover the time a replacement needs to
@@ -240,6 +269,78 @@ type multipathFlow struct {
 	// replacements; the other end keeps waiting for a rescue that is still
 	// somebody's to send.
 	replacementAbandoned atomic.Bool
+
+	// Replacement diagnostics. A flow that fails with "lane replacement
+	// timeout" records only that it gave up, and the live gateway produced 521
+	// of those in two hours without the log saying whether a replacement lane
+	// was ever offered, how many graces were burned, or how long the flow
+	// spent with no lane at all. Distinguishing "nothing was opened" from
+	// "lanes were opened and never became ready" is the difference between a
+	// pool that will not rebuild and a path that will not carry a handshake,
+	// and it cannot be recovered after the fact. See issue #53.
+	replacementWaits     atomic.Uint64
+	replacementTimeouts  atomic.Uint64
+	replacementWaitNanos atomic.Int64
+	lanesJoined          atomic.Uint64
+	// replacementDeadline is when the current outage's grace runs out, in Unix
+	// nanoseconds, or zero when the flow is not in an outage. It is what makes
+	// laneReplacementWait a budget the flow spends once rather than one each
+	// waiter spends separately, and it is cleared in startLane so that a flow
+	// which really is being rescued gets a fresh grace for its next outage.
+	replacementDeadline atomic.Int64
+	// Replacement attempts, counted only for a flow that has no lane left.
+	// `lanes_joined` says whether a replacement was ever admitted, and for
+	// 84% of the gateway's lane-replacement-timeout failures the answer is no
+	// -- but it cannot say why, because a dial whose handshake never completes
+	// never reaches addLane and leaves the record identical to a flow where
+	// nothing was ever dialled. Those are the two faults #53 needs separated:
+	// a client pool that will not rebuild, against a path that will not carry
+	// a handshake. Only the endpoint that opens replacements can tell them
+	// apart, and only while it is trying. The other endpoint reports zeroes,
+	// which is the true answer there: it opens nothing.
+	replacementAttempts atomic.Uint64
+	replacementFailures atomic.Uint64
+	// Stall watchdog state. A lane is declared dead only on I/O error, which
+	// on a path losing one direction means fifteen seconds of receive silence
+	// -- while a flow with a full send window and no acknowledgements is
+	// making no progress long before that. The watchdog measures progress
+	// where delivery to the peer is actually recorded (the acknowledged send
+	// offset) and, finding none while work is pending,
+	// demotes the lane and asks for a rescue beside it. Nothing here closes
+	// anything: suspected lanes keep receiving, and recover their full
+	// eligibility on the first acknowledgement they carry.
+	//
+	// All of it is atomic or local to the watchdog goroutine; it introduces
+	// no lock, and in particular never touches lanesMu while holding chunkMu
+	// or replayMu.
+	lastAckProgressNS atomic.Int64
+	inboundBacklog    inboundBacklog
+	// minRTTNS is the smallest controller minimum-RTT the flow's lanes have
+	// reported, refreshed by observeTransport. The stall threshold is three
+	// of these.
+	minRTTNS atomic.Int64
+	// stallSignal advises the lane manager that a stall episode is in
+	// progress. It is buffered at one and sent non-blockingly: the manager
+	// acts on the flow's current state when it wakes, so a coalesced signal
+	// loses nothing, and a flow with no listener (the server end) never
+	// blocks its watchdog.
+	stallSignal chan struct{}
+	// rescueInFlight is set by the lane manager for the duration of one
+	// rescue round. While it is set the watchdog does not signal: a request
+	// queued behind an active round would only fire a redundant round the
+	// moment the first one returns, before its fresh lane had any chance to
+	// prove itself.
+	rescueInFlight atomic.Bool
+	// stallWatchdogDisabled turns the watchdog goroutine off entirely. Zero
+	// in production; tests that pin exact dial counts set it so recovery
+	// behaviour under measurement is deterministic.
+	stallWatchdogDisabled bool
+	// stallScan and stallGrace are zero in production. Tests shorten them so
+	// the watchdog can be exercised without sleeping for seconds, the same
+	// pattern as abortGrace above.
+	stallScan     time.Duration
+	stallGrace    time.Duration
+	progressGrace time.Duration // test override; production uses laneReplacementWait
 	// controlLaneShared reports whether another flow is currently using the
 	// pooled control connection. Nil means "no", which is what a flow on a
 	// dedicated connection should answer.
@@ -302,6 +403,11 @@ type multipathFlow struct {
 	// gapPending marks that the peer should be told what is held above a gap,
 	// which is an acknowledgement whose cumulative point has not moved.
 	gapPending atomic.Bool
+	// ACK state must be repeated after duplicate DATA or lane recovery even
+	// if the receive cursor did not move. A successful old-lane write does
+	// not prove the peer received it before that lane stopped working.
+	ackRepeatPending atomic.Bool
+	ackReplayLane    atomic.Pointer[mpLane]
 	// receivedRanges publishes what the reassembler currently holds out of
 	// order, so the acknowledgement loop can report it without touching the
 	// reassembler from another goroutine.
@@ -326,6 +432,14 @@ type multipathFlow struct {
 
 	reinjections atomic.Uint64
 
+	// recentMu guards the two-bucket window behind recentBytes, which decides
+	// whether this flow is conversing or transferring at the moment rather
+	// than over its whole life.
+	recentMu               sync.Mutex
+	recentStart            time.Time
+	currentUp, currentDown uint64
+	priorUp, priorDown     uint64
+
 	replayMu sync.Mutex
 	// closeFrame is this flow's half-close, retained until the peer
 	// acknowledges it so a replacement lane can be handed it. It is the whole
@@ -341,10 +455,16 @@ func newMultipathFlow(ctx context.Context, inner net.Conn, sessionID [16]byte, f
 	if len(loggers) > 0 {
 		logger = loggers[0]
 	}
-	return newMultipathFlowWithMemory(ctx, inner, sessionID, flowID, chunkSize, sendAckFlag, recvAckFlag, budget, registry, logger, defaultFlowMemoryLimits(), nil, nil)
+	return newMultipathFlowWithMemory(ctx, inner, sessionID, flowID, chunkSize, sendAckFlag, recvAckFlag, budget, registry, logger, defaultFlowMemoryLimits(), nil, nil, classifier.DefaultConfig())
 }
 
-func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [16]byte, flowID uint64, chunkSize int, sendAckFlag, recvAckFlag uint16, budget *limiter.Budget, registry *metrics.Registry, logger *slog.Logger, memoryLimits flowMemoryLimits, sendMemory, receiveMemory *memlimit.Budget) *multipathFlow {
+func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [16]byte, flowID uint64, chunkSize int, sendAckFlag, recvAckFlag uint16, budget *limiter.Budget, registry *metrics.Registry, logger *slog.Logger, memoryLimits flowMemoryLimits, sendMemory, receiveMemory *memlimit.Budget, classifierCfg classifier.Config) *multipathFlow {
+	// A zero config would classify nothing, which reads as "every flow is new"
+	// rather than as a misconfiguration. Falling back to the documented default
+	// keeps a caller that forgot the parameter on the supported policy.
+	if classifierCfg.NewBytes == 0 || classifierCfg.BulkBytes == 0 {
+		classifierCfg = classifier.DefaultConfig()
+	}
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkSize
 	}
@@ -359,7 +479,8 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 		finalAck: make(chan struct{}, 1), sendDone: make(chan struct{}),
 		done: make(chan struct{}), localClosedCh: make(chan struct{}), remoteAbortCh: make(chan struct{}),
 		ackWake: make(chan struct{}, 1), ackErr: make(chan error, 1),
-		classifier: classifier.New(classifier.DefaultConfig()), started: time.Now(), completionGrace: flowCompletionGrace,
+		stallSignal: make(chan struct{}, 1),
+		classifier:  classifier.New(classifierCfg), started: time.Now(), completionGrace: flowCompletionGrace,
 	}
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
@@ -387,13 +508,13 @@ func (f *multipathFlow) addLane(lane *mpLane) error {
 	}
 	select {
 	case <-f.done:
-		return errors.New("flow is closed")
+		return errLaneFlowClosed
 	default:
 	}
 	f.lanesMu.Lock()
 	if _, exists := f.lanes[lane.id]; exists {
 		f.lanesMu.Unlock()
-		return errors.New("duplicate lane id")
+		return errLaneDuplicateID
 	}
 	limits := f.memoryLimits
 	if limits.laneWriteQueue < 2 || limits.laneControlReserve >= limits.laneWriteQueue {
@@ -414,6 +535,7 @@ func (f *multipathFlow) addLane(lane *mpLane) error {
 	}
 	lane.admitted = time.Now()
 	f.lanes[lane.id] = lane
+	f.lanesJoined.Add(1)
 	if lane.id >= f.nextJoinID {
 		f.nextJoinID = lane.id + 1
 	}
@@ -447,6 +569,13 @@ func (f *multipathFlow) activateLane(lane *mpLane) error {
 }
 
 func (f *multipathFlow) startLane(lane *mpLane) {
+	// This is the one point a lane actually begins carrying traffic, reached
+	// from addLane for an immediate lane and from activateLane for a staged
+	// one, so it is where an outage ends. Ending it here rather than where a
+	// waiter happens to observe the lane matters: nothing obliges a waiter to
+	// look again once it has what it wanted, and a deadline left behind by a
+	// recovered outage would expire the next one before it began.
+	f.endReplacementOutage()
 	// The policy is set before either goroutine exists. Setting it from the
 	// reader, as the first version did, meant the writer could already be
 	// asking for it.
@@ -456,6 +585,9 @@ func (f *multipathFlow) startLane(lane *mpLane) {
 	}
 	go f.readLane(lane)
 	go f.writeLane(lane)
+	if f.ackSequence.Load() > 0 {
+		f.repeatACK(lane)
+	}
 	// A lane admitted while the flow is sending starts carrying data at once;
 	// it does not wait for anything to notice it.
 	if sched := f.scheduler.Load(); sched != nil {
@@ -615,6 +747,17 @@ func (f *multipathFlow) noteRemoteAbort() {
 
 func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 	var observation metrics.QUICObservation
+	// moved is how far the connections under this flow travelled since anyone
+	// last read them. It is not a per-flow quantity: the connections are
+	// pooled, so it is measured against a baseline the connection itself
+	// holds, and a connection two flows share contributes to whichever of
+	// them reads it first rather than to both.
+	var moved metrics.QUICConnectionCounters
+	// folded names the connections whose connection-scoped values have already
+	// been added to this observation. Several lanes of one flow routinely sit
+	// on one pooled connection, and a congestion window or pacing rate added
+	// once per lane describes a transport that does not exist.
+	var folded map[uint64]struct{}
 	for _, lane := range lanes {
 		provider, ok := lane.fc.transport().(laneStatsProvider)
 		if !ok {
@@ -628,12 +771,17 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 		if stats.smoothedRTT > observation.SmoothedRTT {
 			observation.SmoothedRTT = stats.smoothedRTT
 		}
-		observation.BytesSent += stats.bytesSent
-		observation.BytesReceived += stats.bytesReceived
-		observation.PacketsSent += stats.packetsSent
-		observation.PacketsReceived += stats.packetsReceived
-		observation.BytesLost += stats.bytesLost
-		observation.PacketsLost += stats.packetsLost
+		if counted, ok := provider.(laneConnectionProvider); ok {
+			id, delta := counted.connectionTelemetry(stats)
+			moved.Add(delta)
+			if _, seen := folded[id]; seen {
+				continue
+			}
+			if folded == nil {
+				folded = make(map[uint64]struct{}, len(lanes))
+			}
+			folded[id] = struct{}{}
+		}
 		controller := stats.controller
 		if controller.Kind != "" {
 			if observation.ControllerKind == "" {
@@ -654,24 +802,28 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 			if controller.LatestSendRate > observation.ControllerLatestSendRate {
 				observation.ControllerLatestSendRate = controller.LatestSendRate
 			}
-			observation.ControllerSamples += controller.Samples
-			observation.ControllerNonAppSamples += controller.NonAppSamples
-			observation.ControllerAppSamples += controller.AppSamples
-			observation.ControllerStateMisses += controller.StateMisses
-			observation.ControllerZeroSamples += controller.ZeroSamples
 			if controller.Round > observation.ControllerRound {
 				observation.ControllerRound = controller.Round
 			}
 			observation.ControllerPacingRate += controller.PacingRate
 			observation.ControllerCongestionWindow += controller.CongestionWindow
 			observation.ControllerBytesInFlight += controller.BytesInFlight
-			observation.ControllerBytesLost += controller.BytesLost
-			observation.ControllerPacketsLost += controller.PacketsLost
 			if controller.MinRTT > observation.ControllerMinRTT {
 				observation.ControllerMinRTT = controller.MinRTT
 			}
-			if controller.ErasureFloor > observation.ControllerErasureFloor {
-				observation.ControllerErasureFloor = controller.ErasureFloor
+			if controller.Erasure > observation.ControllerErasure {
+				observation.ControllerErasure = controller.Erasure
+			}
+			if controller.SampleMax > observation.ControllerSampleMax {
+				observation.ControllerSampleMax = controller.SampleMax
+				observation.ControllerSampleDelivered = controller.SampleMaxDelivered
+				observation.ControllerSampleInterval = controller.SampleMaxInterval
+			}
+			if controller.SampleMean > observation.ControllerSampleMean {
+				observation.ControllerSampleMean = controller.SampleMean
+			}
+			if controller.DelayBrake > observation.ControllerDelayBrake {
+				observation.ControllerDelayBrake = controller.DelayBrake
 			}
 			observation.ControllerInRecovery = observation.ControllerInRecovery || controller.InRecovery
 		}
@@ -680,6 +832,28 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 		f.currentRTTNS.Store(observation.SmoothedRTT.Nanoseconds())
 		f.baselineRTTNS.CompareAndSwap(0, observation.SmoothedRTT.Nanoseconds())
 	}
+	// The stall watchdog sizes its patience from the smallest minimum-RTT any
+	// lane reports: the best case the path has shown, not the worst lane's
+	// current estimate the telemetry aggregate above publishes.
+	var minRTT time.Duration
+	for _, lane := range lanes {
+		provider, ok := lane.fc.transport().(laneStatsProvider)
+		if !ok {
+			continue
+		}
+		if rtt := provider.transportStats().controller.MinRTT; rtt > 0 && (minRTT == 0 || rtt < minRTT) {
+			minRTT = rtt
+		}
+	}
+	if minRTT > 0 {
+		f.minRTTNS.Store(minRTT.Nanoseconds())
+	}
+	// The connection totals are banked whether or not this flow may still
+	// publish its own gauges. They are monotonic and belong to the connection,
+	// so a late reading can neither pin nor inflate them, and discarding it
+	// would drop bytes the connection really did carry. A nil registry counts
+	// nothing at all, and the call is a no-op against one.
+	f.metrics.AddQUICConnectionCounters(moved)
 	// A finished flow must not publish again. Its registry entry is removed
 	// during teardown, and the lane managers keep polling this snapshot for a
 	// moment after that; a late publication would reinstate an entry with
@@ -690,6 +864,15 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 		f.metrics.ObserveQUIC(f.telemetryID, observation)
 	}
 }
+
+// noteLaneCapacityRefusal records a rescue round the peer answered with its
+// lane-admission ceiling; resetLaneCapacityRefusals clears the streak on any
+// other round outcome, since only consecutive answers mark the desync.
+func (f *multipathFlow) noteLaneCapacityRefusal() { f.capacityRefusals.Add(1) }
+
+func (f *multipathFlow) resetLaneCapacityRefusals() { f.capacityRefusals.Store(0) }
+
+func (f *multipathFlow) laneCapacityRefusals() int64 { return f.capacityRefusals.Load() }
 
 func (f *multipathFlow) laneCount() int {
 	f.lanesMu.RLock()
@@ -707,14 +890,39 @@ func (f *multipathFlow) laneCount() int {
 // dead lane but the server-side socket is still half-open. It is only used at
 // the configured lane cap; deleting the entry keeps the cap a real resource
 // bound rather than allowing unbounded historical lane IDs.
-func (f *multipathFlow) retireOldestLane(control bool) bool {
+//
+// The victim is the oldest evictable lane with the replacement's role, or the
+// oldest evictable lane of any role when no same-role lane exists: role
+// orders the choice but never blocks a rescue. One lane is never evictable --
+// a healthy lane younger than minAge. A lane already suspected stalled
+// can be replaced immediately. Parallel rescue JOINs race
+// to this endpoint, and admission order is not the order the peer crowned its
+// winner in, so a freshly admitted lane may still be waiting on the peer's
+// decision while the racing losers it beat are still arriving; the half-open
+// sockets eviction exists for are never that young. The age window is also
+// what protects a staged lane whose JOIN handshake is still in flight:
+// admission writes its OPEN_OK under a deadline of the same budget, so a
+// staged lane that never activated and is older than minAge is not a
+// handshake in flight but a wedged admission, and retiring it is how the slot
+// is freed. With no evictable lane the JOIN is refused -- the transient
+// capacity answer the racing peer already expects for its losing attempts.
+func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) bool {
 	f.lanesMu.Lock()
 	var victim *mpLane
 	for _, lane := range f.lanes {
-		if lane.closed.Load() || !f.laneReady(lane) || f.laneIsControl(lane) != control {
+		if lane.closed.Load() {
 			continue
 		}
-		if victim == nil || lane.id < victim.id {
+		if minAge > 0 && time.Since(lane.admitted) < minAge && !lane.suspected.Load() {
+			continue
+		}
+		switch {
+		case victim == nil:
+			victim = lane
+		case f.laneIsControl(lane) == control && f.laneIsControl(victim) != control:
+			// A lane with the replacement's role always beats any other role.
+			victim = lane
+		case f.laneIsControl(lane) == f.laneIsControl(victim) && lane.id < victim.id:
 			victim = lane
 		}
 	}
@@ -729,6 +937,24 @@ func (f *multipathFlow) retireOldestLane(control bool) bool {
 		_ = victim.fc.Close()
 	}
 	return true
+}
+
+// removeLane withdraws a lane whose admission failed after it entered the
+// flow -- a staged JOIN lane whose OPEN_OK never left. Anything less leaves
+// a lane that counts against the admission cap but can neither carry traffic
+// nor be scheduled, leaking the slot for the life of the flow.
+func (f *multipathFlow) removeLane(lane *mpLane) {
+	f.lanesMu.Lock()
+	if f.lanes[lane.id] != lane {
+		f.lanesMu.Unlock()
+		return
+	}
+	delete(f.lanes, lane.id)
+	lane.closed.Store(true)
+	f.lanesMu.Unlock()
+	if lane.fc != nil {
+		_ = lane.fc.Close()
+	}
 }
 
 // retireLanesExcept performs an intentional transport handoff without
@@ -863,21 +1089,55 @@ func (f *multipathFlow) readLaneBulk(lane *mpLane) {
 }
 
 func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool {
+	// Identity and terminal cancellation cannot wait behind application DATA.
+	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID {
+		select {
+		case f.ackErr <- errors.New("frame belongs to another session or flow"):
+		default:
+		}
+		return false
+	}
+	if frame.Header.Type == protocol.TypeReset {
+		err := errors.New("peer reset flow")
+		if len(frame.Payload) > 1 {
+			err = fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
+		}
+		select {
+		case f.ackErr <- err:
+		default:
+		}
+		f.closeAll()
+		return false
+	}
+	if frame.Header.Type == protocol.TypeClose && frame.Header.Flags&protocol.FlagCloseAbort != 0 {
+		if frame.Header.Flags&protocol.FlagFin == 0 || len(frame.Payload) != 0 || frame.Header.Flags&(protocol.FlagAckFinal|protocol.FlagAckUp|protocol.FlagAckDown) != 0 {
+			select {
+			case f.ackErr <- errors.New("invalid flow close frame"):
+			default:
+			}
+			return false
+		}
+		_ = f.acknowledgeRemoteFIN(f.ctx, frame.Header.Sequence, true)
+		f.closeAll()
+		return false
+	}
+	// Cumulative/SACK state clocks the opposite sending direction. It must
+	// not wait behind a blocked application write or a full DATA event queue.
+	// Final ACKs remain ordered with FIN and local-abort lifecycle events.
+	if frame.Header.Type == protocol.TypeAck && frame.Header.Flags&protocol.FlagAckFinal == 0 {
+		if err := f.receiveProgressACK(lane, frame); err != nil {
+			select {
+			case f.ackErr <- err:
+			default:
+			}
+			return false
+		}
+		return true
+	}
 	if frame.Header.Type == protocol.TypeData {
 		lane.recv.Add(uint64(len(frame.Payload)))
 	}
-	select {
-	case f.events <- inboundEvent{lane: lane, frame: frame}:
-		return true
-	case <-f.done:
-		// Flow teardown is independent of the client lifetime. In particular,
-		// a reader can be waiting behind a full event queue when another lane
-		// completes or aborts the flow; waiting only on f.ctx would strand that
-		// goroutine until the entire VPN stopped.
-		return false
-	case <-f.ctx.Done():
-		return false
-	}
+	return f.enqueueInbound(inboundEvent{lane: lane, frame: frame})
 }
 
 // prefersCodingOverRetransmission reports whether this flow would rather spend
@@ -891,20 +1151,34 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 func (f *multipathFlow) prefersCodingOverRetransmission() bool {
 	// How much this flow has moved is the immediate answer; the class is the
 	// considered one. Both are needed because they become available at
-	// different times.
-	//
-	// The class takes a second to settle, and a transfer from a fast local
-	// destination produces most of its frames inside that second -- measured
-	// live, 265 of a download's 557 data frames were coded before the class
-	// caught up. A flow that has already moved more than a small exchange's
-	// worth is not a small exchange, whatever it is later decided to be, and
-	// coding it spends bandwidth to save round trips it was not going to
-	// notice.
-	if f.bytesUp.Load()+f.bytesDown.Load() > codedFlowBytes {
-		return false
-	}
+	// different times, and each is wrong about a case the other gets right.
 	f.refreshClass()
-	return classifier.Class(f.class.Load()) != classifier.ClassBulk
+	switch classifier.Class(f.class.Load()) {
+	case classifier.ClassBulk:
+		// Measured by bytes per second, and a code that provisions for the
+		// binomial spends more of them than retransmitting what was lost.
+		return false
+	case classifier.ClassInteractive:
+		// A sequence of small exchanges, however many of them it has done.
+		//
+		// The byte cutoff below cannot see this and gets it exactly backwards.
+		// Eighty bytes fifty times a second is four kilobytes a second, so a
+		// voice call crosses the cutoff after about a minute and carries the
+		// rest of itself uncoded -- losing its repair precisely where the
+		// repair matters, because a stream of small messages separated by idle
+		// never amortises a round trip over anything. Every lost frame pays a
+		// full round trip by itself. Measured on an emulated 14% path, an
+		// uncoded frame stream loses 71 of 400 frames outright where a
+		// duplicated one loses 10, and the delivered frames are no slower.
+		return true
+	}
+	// Still unclassified. The class takes a second to settle, and a transfer
+	// from a fast local destination produces most of its frames inside that
+	// second -- measured live, 265 of a download's 557 data frames were coded
+	// before the class caught up. A flow that has already moved more than a
+	// small exchange's worth is not a small exchange, whatever it is later
+	// decided to be.
+	return f.bytesUp.Load()+f.bytesDown.Load() <= codedFlowBytes
 }
 
 // codedFlowBytes is how much a flow may carry and still be treated as an
@@ -1077,6 +1351,7 @@ func (f *multipathFlow) laneCandidates(bulk bool) ([]*mpLane, error) {
 	if len(lanes) == 0 {
 		return nil, errors.New("no healthy lanes")
 	}
+	lanes = preferUnsuspectedLanes(lanes)
 	if !bulk {
 		// Prefer the explicit control role. It begins on lane zero, but a
 		// connection-generation reset replaces it with a non-zero JOIN lane.
@@ -1090,6 +1365,31 @@ func (f *multipathFlow) laneCandidates(bulk bool) ([]*mpLane, error) {
 		return lanes[:1], nil
 	}
 	return f.dataLane(lanes), nil
+}
+
+// preferUnsuspectedLanes implements the watchdog's demote-don't-kill rule:
+// while any healthy lane is not stall-suspected, new writes avoid the
+// suspected ones. When every healthy lane is suspected the set is returned
+// unchanged -- a suspected lane that is the only lane still carries the flow,
+// because the suspicion is a reason to look for something better, never a
+// reason to stop using what there is.
+func preferUnsuspectedLanes(lanes []*mpLane) []*mpLane {
+	clear := 0
+	for _, lane := range lanes {
+		if !lane.suspected.Load() {
+			clear++
+		}
+	}
+	if clear == 0 || clear == len(lanes) {
+		return lanes
+	}
+	preferred := make([]*mpLane, 0, clear)
+	for _, lane := range lanes {
+		if !lane.suspected.Load() {
+			preferred = append(preferred, lane)
+		}
+	}
+	return preferred
 }
 
 // dataLane selects the lanes a flow's data rides.
@@ -1171,6 +1471,10 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 	go f.telemetryLoop(telemetryStop)
 	completionStop := make(chan struct{})
 	go f.completionWatchdog(completionStop)
+	stallStop := make(chan struct{})
+	if !f.stallWatchdogDisabled {
+		go f.stallWatchdog(stallStop)
+	}
 	limitsStop := make(chan struct{})
 	limitErr := make(chan error, 1)
 	go f.watchLimits(limitsStop, limitErr)
@@ -1186,6 +1490,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 		cancelACKs()
 		close(limitsStop)
 		close(completionStop)
+		close(stallStop)
 		close(telemetryStop)
 	}()
 	defer f.finished.Store(true)
@@ -1280,7 +1585,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
 			stats.LaneBytes = f.laneStats()
-			return stats, fmt.Errorf("cumulative acknowledgement: %w", err)
+			return stats, fmt.Errorf("flow progress: %w", err)
 		case failure := <-f.laneErr:
 			err := failure.err
 			// Both FIN directions have already been observed. The application
@@ -1457,6 +1762,211 @@ func (f *multipathFlow) completionWatchdog(stop <-chan struct{}) {
 		}
 	}
 }
+
+const (
+	// stallScanInterval is the watchdog's detection granularity. It is well
+	// under the smallest threshold the clamp below can produce, so a stall is
+	// suspected within one threshold of becoming true rather than one scan.
+	stallScanInterval = 100 * time.Millisecond
+	// The threshold is three minimum round trips, clamped. The floor keeps a
+	// fast LAN path from paying a rescue for an ordinary scheduling hiccup;
+	// the cap keeps a slow path from waiting so long that the rescue itself
+	// becomes the flow's whole remaining budget. Before any RTT sample
+	// exists the flow gets the conservative default: long enough that a
+	// handshake still finding its path is not a stall, short enough to
+	// matter against the fifteen seconds an I/O error takes.
+	stallRTTMultiplier    = 3
+	stallThresholdFloor   = 250 * time.Millisecond
+	stallThresholdCap     = 2 * time.Second
+	stallThresholdDefault = time.Second
+)
+
+// stallThreshold is how long pending work may see no forward progress before
+// the flow is suspected stalled: three minimum round trips, clamped.
+func (f *multipathFlow) stallThreshold() time.Duration {
+	if f.stallGrace > 0 {
+		return f.stallGrace
+	}
+	rtt := time.Duration(f.minRTTNS.Load())
+	if rtt <= 0 {
+		rtt = time.Duration(f.currentRTTNS.Load())
+	}
+	if rtt <= 0 {
+		return stallThresholdDefault
+	}
+	threshold := stallRTTMultiplier * rtt
+	if threshold < stallThresholdFloor {
+		return stallThresholdFloor
+	}
+	if threshold > stallThresholdCap {
+		return stallThresholdCap
+	}
+	return threshold
+}
+
+// pendingOutbound reports whether the flow holds bytes the peer has not
+// acknowledged. This is the watchdog's strict gate: a flow whose application
+// simply has nothing to send is never a stall, however quiet the path is.
+func (f *multipathFlow) pendingOutbound() bool {
+	f.replayMu.Lock()
+	unacked := f.highestSent > f.acked
+	f.replayMu.Unlock()
+	if unacked {
+		return true
+	}
+	f.chunkMu.Lock()
+	pending := len(f.outstandingChunks) > 0
+	f.chunkMu.Unlock()
+	return pending
+}
+
+// scanStall advances one pending/progress pair and reports whether the pair
+// has now been pending without progress for the threshold. The clock starts
+// when pending is first observed and restarts at every newer progress stamp,
+// so a flow that sat idle for an hour and then sent one byte gets a full
+// threshold for that byte's round trip.
+func scanStall(pending bool, progressNS int64, now time.Time, threshold time.Duration, since *time.Time) bool {
+	if !pending {
+		*since = time.Time{}
+		return false
+	}
+	if since.IsZero() {
+		*since = now
+		return false
+	}
+	if progressNS > 0 {
+		if progress := time.Unix(0, progressNS); progress.After(*since) {
+			*since = progress
+			return false
+		}
+	}
+	return now.Sub(*since) >= threshold
+}
+
+// stallWatchdog is the flow's "lane sick" detector, the complement of
+// failLane: failLane learns a lane is dead from an I/O error, which on a path
+// erasing one direction takes the transport's whole idle timeout of receive
+// silence. This watchdog instead measures forward progress -- the
+// acknowledged send offset moving, payload arriving -- and, finding none for
+// three round trips while work is pending, demotes the current data lane and
+// asks the lane manager for a rescue. It never fails a lane and never closes
+// anything: the suspected lane keeps receiving and is used again the moment
+// nothing healthier exists, and an acknowledgement arriving on it clears the
+// suspicion outright.
+func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
+	interval := f.stallScan
+	if interval <= 0 {
+		interval = stallScanInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var sendSince time.Time
+	episode := false
+	var lastSignal time.Time
+	for {
+		select {
+		case <-ticker.C:
+		case <-stop:
+			return
+		case <-f.ctx.Done():
+			return
+		}
+		now := time.Now()
+		threshold := f.stallThreshold()
+		stalledSend := scanStall(f.pendingOutbound(), f.lastAckProgressNS.Load(), now, threshold, &sendSince)
+		// Application bytes do not imply a response: TLS, HTTP/2 control
+		// messages, uploads and slow origins can legitimately be silent after
+		// delivery. Only unacknowledged transport work justifies lane rescue.
+		if !stalledSend {
+			episode = false
+			continue
+		}
+		// Successful JOINs and incoming traffic do not establish progress for
+		// outstanding outbound bytes. Bound the entire stall, not each retry.
+		var terminal error
+		switch {
+		case f.resumeRefused.Load():
+			terminal = errResumeRefused
+		case f.replacementAbandoned.Load():
+			terminal = errReplacementAbandoned
+		case now.Sub(sendSince) >= f.progressTimeout():
+			terminal = errFlowNoProgress
+		}
+		if terminal != nil {
+			if f.logger != nil {
+				f.logger.Warn("flow cannot make delivery progress", "flow_id", f.flowID, "error", terminal, "pending_for", now.Sub(sendSince))
+			}
+			select {
+			case f.ackErr <- terminal:
+			default:
+			}
+			// Also interrupt a coordinator currently waiting for lane replacement;
+			// it must not add another outage budget after this deadline expires.
+			f.closeAll()
+			return
+		}
+		// Optimistic DATA may precede OPEN_OK. A JOIN cannot rescue a session
+		// the server has not admitted yet; racing it against OPEN can turn a
+		// slow handshake into a misleading permanent "unknown session" refusal.
+		// The overall no-progress budget still bounds this initial wait.
+		if f.openConfirmationRequired.Load() {
+			continue
+		}
+		if !episode {
+			episode = true
+			spare := f.suspectDataLanes()
+			if f.metrics != nil {
+				f.metrics.FlowStallDetected()
+				if spare {
+					f.metrics.StallSpareAttached()
+				}
+			}
+			if f.logger != nil {
+				f.logger.Info("flow stall suspected; lane demoted and rescue requested",
+					"flow_id", f.flowID, "threshold", threshold,
+					"send_stalled", stalledSend,
+					"healthy_spare", spare, "lanes", f.laneCount(),
+					"bytes_up", f.bytesUp.Load(), "bytes_down", f.bytesDown.Load())
+			}
+		}
+		// The manager's own backoff paces the dials; this pacing only keeps a
+		// persistent stall from queueing signals faster than they can be
+		// acted on. An episode that outlives its rescue still re-asks, because
+		// the stall it describes is still true. While a round is in flight it
+		// does not ask at all: the queued request would be answered by state
+		// the round is about to change.
+		if now.Sub(lastSignal) >= threshold && !f.rescueInFlight.Load() {
+			select {
+			case f.stallSignal <- struct{}{}:
+				lastSignal = now
+			default:
+			}
+		}
+	}
+}
+
+// suspectDataLanes marks the lanes currently carrying the flow's data as
+// stall-suspected and reports whether a non-suspected healthy lane remains to
+// take over new writes at once -- the warm-spare case, where the switch costs
+// one scheduler poll rather than a handshake.
+func (f *multipathFlow) suspectDataLanes() bool {
+	lanes := f.healthyLanes()
+	if len(lanes) == 0 {
+		return false
+	}
+	for _, lane := range f.dataLane(lanes) {
+		lane.suspected.Store(true)
+	}
+	for _, lane := range f.healthyLanes() {
+		if !lane.suspected.Load() {
+			return true
+		}
+	}
+	return false
+}
+
+// stallSignals exposes the watchdog's rescue request to the lane manager.
+func (f *multipathFlow) stallSignals() <-chan struct{} { return f.stallSignal }
 
 func (f *multipathFlow) telemetryLoop(stop <-chan struct{}) {
 	ticker := time.NewTicker(time.Second)
@@ -1643,8 +2153,49 @@ func (f *multipathFlow) tryEnqueueFrameClass(lane *mpLane, frame protocol.Frame,
 // longer cannot produce a lane nobody is going to open.
 func (f *multipathFlow) noteReplacementAbandoned() { f.replacementAbandoned.Store(true) }
 
+// replacementLogFields is what this flow's lane replacements did, named the
+// same way on both endpoints so a client record and a gateway record about the
+// same failure can be read side by side.
+//
+// They are emitted on every flow record rather than only on failures. A
+// replacement that succeeded is the control case for one that did not, and a
+// field that appears only when something went wrong cannot be compared against
+// the ordinary run of flows.
+func (f *multipathFlow) replacementLogFields() []any {
+	waits, timeouts, joined, waited := f.replacementDiagnostics()
+	return []any{
+		"lane_replacement_waits", waits,
+		"lane_replacement_timeouts", timeouts,
+		"lane_replacement_wait", waited,
+		"lanes_joined", joined,
+		"lane_replacement_attempts", f.replacementAttempts.Load(),
+		"lane_replacement_failures", f.replacementFailures.Load(),
+	}
+}
+
+// noteReplacementAttempt records that this endpoint has begun opening a
+// replacement lane for a flow that has none. It is counted at the point the
+// dial starts rather than when it finishes, because a dial that never returns
+// is exactly the case the count exists to make visible.
+func (f *multipathFlow) noteReplacementAttempt() { f.replacementAttempts.Add(1) }
+
+// noteReplacementFailure records that one such attempt did not produce a lane.
+// Attempts without failures mean the dials are still outstanding; attempts
+// equal to failures mean the path is refusing to carry a handshake; no
+// attempts at all means nothing tried.
+func (f *multipathFlow) noteReplacementFailure() { f.replacementFailures.Add(1) }
+
+// replacementDiagnostics reports what this flow's lane replacements did, for
+// the record written when a flow ends. Zero waits is the ordinary case and
+// says the flow never lost its last healthy lane.
+func (f *multipathFlow) replacementDiagnostics() (waits, timeouts, joined uint64, waited time.Duration) {
+	return f.replacementWaits.Load(), f.replacementTimeouts.Load(), f.lanesJoined.Load(),
+		time.Duration(f.replacementWaitNanos.Load())
+}
+
 func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Duration) error {
 	if len(f.healthyLanes()) > 0 {
+		f.endReplacementOutage()
 		return nil
 	}
 	if f.resumeRefused.Load() {
@@ -1653,7 +2204,25 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 	if f.replacementAbandoned.Load() {
 		return errReplacementAbandoned
 	}
-	timer := time.NewTimer(timeout)
+	f.replacementWaits.Add(1)
+	waitStarted := time.Now()
+	defer func() { f.replacementWaitNanos.Add(int64(time.Since(waitStarted))) }()
+	// The grace belongs to the outage, not to this call. Four call sites wait
+	// for the last lane -- run, the frame and control writers, and the
+	// acknowledgement loop -- and a lane that dies with a write in flight puts
+	// more than one of them here for the same missing lane. Each used to start
+	// a full grace of its own, so the flow's real willingness to wait was a
+	// multiple of this constant that depended on which writers happened to be
+	// blocked.
+	remaining := f.replacementBudget(waitStarted, timeout)
+	if remaining <= 0 {
+		// The outage already outlived its grace. Waiting again cannot produce
+		// a lane; it only holds the application open for another full grace
+		// before telling it what is already known.
+		f.replacementTimeouts.Add(1)
+		return errLaneReplacementTimeout
+	}
+	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
@@ -1661,6 +2230,7 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 		select {
 		case <-ticker.C:
 			if len(f.healthyLanes()) > 0 {
+				f.endReplacementOutage()
 				return nil
 			}
 			if f.resumeRefused.Load() {
@@ -1684,11 +2254,71 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 				return errReplacementAbandoned
 			}
 		case <-timer.C:
-			return errors.New("lane replacement timeout")
+			f.replacementTimeouts.Add(1)
+			return errLaneReplacementTimeout
 		case <-f.done:
 			return errors.New("flow closed while waiting for lane replacement")
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+}
+
+// replacementBudget reports what is left of the current outage's grace,
+// opening one at now+grace if this waiter is the first to find the flow
+// without a lane. A negative or zero result means the outage has already had
+// its whole grace and nothing is owed to a further waiter.
+//
+// A deadline more than a grace into the past is not this outage's. It is the
+// residue of one that ended in the narrow window between a waiter finding no
+// lane and the arriving lane clearing the outage, where the waiter's own
+// deadline lands after the clear and nothing is left to remove it. Reading it
+// as current would deny a whole grace to an outage that had not started, so
+// it is discarded. The cost of being wrong is the opposite and smaller: a
+// waiter that turns up more than a grace after the last one expired -- on a
+// flow the expiry has usually already failed -- gets one grace of its own
+// rather than none.
+func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) time.Duration {
+	for {
+		if deadline := f.replacementDeadline.Load(); deadline != 0 {
+			remaining := time.Unix(0, deadline).Sub(now)
+			if remaining > -grace {
+				return remaining
+			}
+			if !f.replacementDeadline.CompareAndSwap(deadline, 0) {
+				continue
+			}
+		}
+		if f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano()) {
+			return grace
+		}
+	}
+}
+
+// endReplacementOutage forgets the current outage's deadline, so the next one
+// starts from a full grace.
+func (f *multipathFlow) endReplacementOutage() { f.replacementDeadline.Store(0) }
+
+// extendReplacementOutage restarts the current outage's grace from now, and
+// reports whether there was an outage to extend. It exists for the endpoint
+// that waits for a rescue rather than sends one: a rescue JOIN that arrives
+// while the flow is waiting out its grace is observable proof that the peer's
+// recovery is alive and mid-handshake, and letting the hard deadline expire
+// underneath that handshake fails the flow at the moment its rescue is
+// landing. A flow not in an outage has nothing to extend, and a deadline
+// more than a grace into the past is the residue of an outage that already
+// ended, which replacementBudget's own staleness rule discards.
+func (f *multipathFlow) extendReplacementOutage(now time.Time, grace time.Duration) bool {
+	for {
+		deadline := f.replacementDeadline.Load()
+		if deadline == 0 {
+			return false
+		}
+		if time.Unix(0, deadline).Sub(now) <= -grace {
+			return false
+		}
+		if f.replacementDeadline.CompareAndSwap(deadline, now.Add(grace).UnixNano()) {
+			return true
 		}
 	}
 }
@@ -1703,6 +2333,7 @@ func (f *multipathFlow) acknowledgeReplay(sequence uint64, final bool) error {
 		f.replayMu.Unlock()
 		return nil // delayed ACK from a slower lane
 	}
+	advanced := sequence > f.acked
 	f.acked = sequence
 	if f.ackTrack != nil {
 		f.ackTrack.Advance(sequence)
@@ -1711,6 +2342,12 @@ func (f *multipathFlow) acknowledgeReplay(sequence uint64, final bool) error {
 		f.closeFrame = nil
 	}
 	f.replayMu.Unlock()
+	if advanced {
+		// The acknowledged send offset is the most direct proof that this
+		// flow's bytes are reaching the peer: it only moves when the peer's
+		// receiver says so. It is the stall watchdog's send-side clock.
+		f.lastAckProgressNS.Store(time.Now().UnixNano())
+	}
 	return nil
 }
 
@@ -1772,6 +2409,10 @@ func (f *multipathFlow) writeControl(ctx context.Context, frame protocol.Frame, 
 }
 
 func (f *multipathFlow) writeACK(ctx context.Context, sequence uint64, direction uint16, final bool) error {
+	return f.writeACKPreferred(ctx, sequence, direction, final, nil)
+}
+
+func (f *multipathFlow) writeACKPreferred(ctx context.Context, sequence uint64, direction uint16, final bool, preferred *mpLane) error {
 	flags := direction
 	if final {
 		flags |= protocol.FlagAckFinal
@@ -1795,6 +2436,28 @@ func (f *multipathFlow) writeACK(ctx context.Context, sequence uint64, direction
 	// flow coordinator must observe the failure immediately so a replacement
 	// can be admitted and the latest ACK/FIN state replayed there.
 	lanes := f.healthyLanes()
+	// A rescue must carry ACK state on the new lane, not enqueue it on the
+	// same old transport whose missing ACK prompted the rescue. Otherwise
+	// prefer non-suspected lanes while retaining every lane as a fallback.
+	// Stable insertion uses one suspicion observation per lane, rather than
+	// a sort comparator whose ordering could change during concurrent ACKs.
+	front := 0
+	for i, lane := range lanes {
+		if lane == preferred {
+			copy(lanes[1:i+1], lanes[:i])
+			lanes[0] = lane
+			front = 1
+			break
+		}
+	}
+	for i := front; i < len(lanes); i++ {
+		lane := lanes[i]
+		if !lane.suspected.Load() {
+			copy(lanes[front+1:i+1], lanes[front:i])
+			lanes[front] = lane
+			front++
+		}
+	}
 	if len(lanes) == 0 {
 		return errors.New("no healthy lane for acknowledgement")
 	}
@@ -1873,6 +2536,12 @@ func (f *multipathFlow) acknowledgeArrival(reassembler *multipath.Reassembler, l
 		f.publishReceivedRanges(reassembler)
 		f.reportGap()
 	}
+	// DATA arrived without moving the cursor: the sender may be replaying
+	// after an ACK was lost. Repeat the cumulative point even without
+	// selective-ACK negotiation or any remaining out-of-order bytes.
+	if reassembler.NextSequence() > 0 {
+		f.repeatACK(nil)
+	}
 	return lastAck
 }
 
@@ -1883,6 +2552,22 @@ func (f *multipathFlow) reportGap() {
 		return
 	}
 	f.gapPending.Store(true)
+	select {
+	case f.ackWake <- struct{}{}:
+	default:
+	}
+}
+
+// repeatACK coalesces replay requests and optionally targets the newly
+// admitted lane. It never blocks the receive loop on transport writes.
+func (f *multipathFlow) repeatACK(lane *mpLane) {
+	if f.ackClosing.Load() {
+		return
+	}
+	if lane != nil {
+		f.ackReplayLane.Store(lane)
+	}
+	f.ackRepeatPending.Store(true)
 	select {
 	case f.ackWake <- struct{}{}:
 	default:
@@ -1948,11 +2633,14 @@ func (f *multipathFlow) ackLoop(ctx context.Context) {
 			// A gap report carries the same cumulative point as the last
 			// acknowledgement and different ranges above it, so the cumulative
 			// point cannot be what decides whether to send.
-			if sequence <= sent && !f.gapPending.Swap(false) {
+			gap := f.gapPending.Swap(false)
+			repeat := f.ackRepeatPending.Swap(false)
+			preferred := f.ackReplayLane.Swap(nil)
+			if sequence <= sent && !gap && !repeat && preferred == nil {
 				break
 			}
 			ackStart := time.Now()
-			err := f.writeACK(ctx, sequence, f.recvAckFlag, false)
+			err := f.writeACKPreferred(ctx, sequence, f.recvAckFlag, false, preferred)
 			f.ackWriteNS.Add(uint64(time.Since(ackStart)))
 			f.acksOut.Add(1)
 			if err != nil {
@@ -1976,6 +2664,7 @@ func (f *multipathFlow) ackLoop(ctx context.Context) {
 					}
 					return
 				}
+				f.ackRepeatPending.Store(true)
 				// Re-acknowledge from where the peer was last told, so the
 				// replacement lane carries the state the dead one was holding.
 				continue
@@ -2018,6 +2707,47 @@ func (f *multipathFlow) acknowledgeRemoteFIN(ctx context.Context, sequence uint6
 			return nil
 		}
 		return err
+	}
+	return nil
+}
+
+// receiveProgressACK handles only non-final ACKs. Its state is protected by
+// replayMu, ackTracker's lock, or atomics, so independent lane readers can
+// advance delivery without involving the application receive loop.
+func (f *multipathFlow) receiveProgressACK(lane *mpLane, frame protocol.Frame) error {
+	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID {
+		return errors.New("frame belongs to another session or flow")
+	}
+	if frame.Header.Flags&f.sendAckFlag == 0 {
+		return errors.New("acknowledgement has wrong direction")
+	}
+	var ranges [][2]uint64
+	if frame.Header.Flags&protocol.FlagAckRanges != 0 {
+		var err error
+		ranges, err = protocol.DecodeAckRanges(frame.Payload, frame.Header.Sequence)
+		if err != nil {
+			return fmt.Errorf("acknowledgement ranges: %w", err)
+		}
+	}
+	f.replayMu.Lock()
+	advances := frame.Header.Sequence > f.acked
+	highestSent := f.highestSent
+	f.replayMu.Unlock()
+	for _, r := range ranges {
+		if r[1] > highestSent {
+			return fmt.Errorf("acknowledgement range %d exceeds sent sequence %d", r[1], highestSent)
+		}
+	}
+	if err := f.acknowledgeReplay(frame.Header.Sequence, false); err != nil {
+		return err
+	}
+	f.acksIn.Add(1)
+	rangeProgress := f.ackTrack.Add(ranges)
+	if rangeProgress {
+		f.lastAckProgressNS.Store(time.Now().UnixNano())
+	}
+	if lane != nil && (advances || rangeProgress) {
+		lane.suspected.Store(false)
 	}
 	return nil
 }
@@ -2068,7 +2798,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 		if len(out) == 0 || f.localAbortSent.Load() {
 			return nil
 		}
-		if err := writeFull(f.inner, out); err != nil {
+		if err := f.writeApplication(out); err != nil {
 			if !expectedHalfCloseError(err) && !expectedDestinationCloseError(err) {
 				return err
 			}
@@ -2121,7 +2851,18 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			switch frame.Header.Type {
 			case protocol.TypeData:
 				if remoteFin {
-					return errors.New("data received after flow FIN")
+					// Recovery can replay already-delivered bytes on a lane
+					// whose delivery trails the FIN on another lane. Accept
+					// only a nonempty duplicate wholly before the final offset;
+					// subtraction keeps the bounds check safe from overflow.
+					final := reassembler.NextSequence()
+					if len(frame.Payload) == 0 || frame.Header.Sequence > final || uint64(len(frame.Payload)) > final-frame.Header.Sequence {
+						return errors.New("data received after flow FIN")
+					}
+					if err := f.acknowledgeRemoteFIN(ctx, final, false); err != nil {
+						return err
+					}
+					continue
 				}
 				out, closed, err := reassembler.Insert(multipath.Segment{Sequence: frame.Header.Sequence, Payload: frame.Payload})
 				if err != nil {
@@ -2190,22 +2931,18 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					}
 				}
 			case protocol.TypeAck:
+				if frame.Header.Flags&protocol.FlagAckFinal == 0 {
+					if err := f.receiveProgressACK(event.lane, frame); err != nil {
+						return err
+					}
+					continue
+				}
 				f.acksIn.Add(1)
 				if frame.Header.Flags&f.sendAckFlag == 0 {
 					return errors.New("acknowledgement has wrong direction")
 				}
-				if frame.Header.Flags&protocol.FlagAckFinal == 0 {
-					if err := f.acknowledgeReplay(frame.Header.Sequence, false); err != nil {
-						return err
-					}
-					if frame.Header.Flags&protocol.FlagAckRanges != 0 {
-						ranges, err := protocol.DecodeAckRanges(frame.Payload, frame.Header.Sequence)
-						if err != nil {
-							return fmt.Errorf("acknowledgement ranges: %w", err)
-						}
-						f.ackTrack.Add(ranges)
-					}
-					continue
+				if event.lane != nil {
+					event.lane.suspected.Store(false)
 				}
 				if frame.Header.Sequence == f.finSequence.Load() {
 					if err := f.acknowledgeReplay(frame.Header.Sequence, true); err != nil {
@@ -2285,11 +3022,59 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 	}
 }
 
-// smallExchangeBytes is how much a direction may carry and still be one of
-// the small exchanges an interactive flow is made of. It matches the
+// smallExchangeBytes is how much a direction may carry per second and still be
+// one of the small exchanges an interactive flow is made of. It matches the
 // classifier's own new-flow byte budget: past this, a direction is carrying
 // content rather than conversation.
+//
+// It is a rate rather than a total. Measuring the total made the signal expire
+// with the flow's age: a voice call carrying eighty bytes fifty times a second
+// crosses any fixed byte budget eventually, and then stops looking like a
+// conversation for the rest of the call however it behaves. Sixty-four
+// kilobytes a second is half a megabit, which no conversation approaches and
+// no transfer stays under.
 const smallExchangeBytes = 64 * 1024
+
+// exchangeWindow is the period the rate above is measured over. It is longer
+// than a round trip on the paths this project targets, so a single burst in
+// flight does not fill it, and short enough that a flow which changes what it
+// is doing is reclassified within a few seconds.
+const exchangeWindow = time.Second
+
+// recentBytes reports what each direction has carried in the last
+// exchangeWindow, which is what says whether this flow is conversing or
+// transferring right now.
+//
+// The window is a pair of buckets rather than a ring: one accumulating and one
+// finished. When the accumulating bucket ages out it becomes the finished one
+// and a fresh bucket starts, so the reported figure covers between one and two
+// windows of traffic. That is coarse, and it is deliberately coarser than the
+// decision it feeds: the classifier's thresholds are an order of magnitude
+// apart, so a factor of two in the measurement window cannot move a
+// conversation across them.
+func (f *multipathFlow) recentBytes(now time.Time, n int, up bool) (uint64, uint64) {
+	f.recentMu.Lock()
+	defer f.recentMu.Unlock()
+	if f.recentStart.IsZero() {
+		f.recentStart = now
+	}
+	if now.Sub(f.recentStart) >= exchangeWindow {
+		f.priorUp, f.priorDown = f.currentUp, f.currentDown
+		f.currentUp, f.currentDown = 0, 0
+		f.recentStart = now
+	}
+	// A byte count is never negative, but this is the one place a wrong sign
+	// would wrap the window to something enormous and make every flow look
+	// like a transfer for the next two seconds.
+	if n > 0 {
+		if up {
+			f.currentUp += uint64(n)
+		} else {
+			f.currentDown += uint64(n)
+		}
+	}
+	return f.currentUp + f.priorUp, f.currentDown + f.priorDown
+}
 
 func (f *multipathFlow) observe(n int, up bool) bool {
 	now := time.Now()
@@ -2306,6 +3091,7 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 	} else {
 		downBytes += uint64(n)
 	}
+	recentUp, recentDown := f.recentBytes(now, n, up)
 	obs := classifier.Observation{
 		BytesUp: upBytes, BytesDown: downBytes,
 		UpRate: float64(upBytes) / age.Seconds(), DownRate: float64(downBytes) / age.Seconds(),
@@ -2316,8 +3102,8 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 			}
 			return now.Sub(time.Unix(0, previousPayload))
 		}(),
-		// Whether this flow is made of small exchanges, not whether this
-		// particular read was small.
+		// Whether this flow is made of small exchanges, measured over a recent
+		// window rather than over its whole life.
 		//
 		// Taking it from the read size made a download permanently
 		// unclassifiable: a 10 MB transfer is read in 16 KiB chunks, so every
@@ -2327,7 +3113,16 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 		// flow stayed ClassNew to the end and was coded from first byte to
 		// last, which cost about a fifth of its throughput on the measured
 		// path.
-		SmallBidirectionalBursts: upBytes <= smallExchangeBytes && downBytes <= smallExchangeBytes,
+		//
+		// Taking it from the lifetime total has the opposite failure and it is
+		// the one that matters for a session. Any long-lived conversation
+		// eventually carries more than a fixed budget, so it stops satisfying
+		// this and is demoted to bulk while still behaving exactly as it
+		// always did. A voice call reaches that point after about a minute.
+		//
+		// A recent rate is right for both. A transfer never drops under it; a
+		// conversation never reaches it, whatever its age.
+		SmallBidirectionalBursts: recentUp <= smallExchangeBytes && recentDown <= smallExchangeBytes,
 	}
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)
@@ -2500,6 +3295,11 @@ var errResumeRefused = errors.New("peer does not hold this session")
 // errReplacementAbandoned reports that this endpoint has stopped attempting
 // replacement lanes for the flow, so its grace has nothing left to wait for.
 var errReplacementAbandoned = errors.New("no replacement lane will be attempted")
+
+// errLaneReplacementTimeout reports that an outage outlived the whole
+// replacement grace. The text is what the live gateway's failure records
+// already say, and is kept verbatim so those records stay greppable.
+var errLaneReplacementTimeout = errors.New("lane replacement timeout")
 
 // retainClose keeps this flow's half-close so a replacement lane can be given
 // it when the lane that carried it dies first.

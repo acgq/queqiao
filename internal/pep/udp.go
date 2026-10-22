@@ -400,18 +400,44 @@ type udpAssociation struct {
 	token  []byte
 }
 
+type udpAssociationOpenTransportError struct {
+	operation string
+	err       error
+}
+
+func (e *udpAssociationOpenTransportError) Error() string {
+	return e.operation + ": " + e.err.Error()
+}
+
+func (e *udpAssociationOpenTransportError) Unwrap() error { return e.err }
+
 func (c *Client) openUDPAssociation(ctx context.Context, resume []byte) (*udpAssociation, error) {
-	return c.openUDPAssociationMode(ctx, resume, false, false)
+	association, err := c.openUDPAssociationMode(ctx, resume, false, false)
+	if err == nil || ctx.Err() != nil {
+		return association, err
+	}
+	var transportErr *udpAssociationOpenTransportError
+	if !errors.As(err, &transportErr) {
+		return nil, err
+	}
+	// The first failure has already retired a timed-out pooled QUIC
+	// generation. AUTO uses its authenticated TCP path for this one bounded
+	// retry, while later associations are free to establish a fresh QUIC pool.
+	retry, retryErr := c.openUDPAssociationMode(ctx, resume, true, false)
+	if retryErr != nil {
+		return nil, fmt.Errorf("UDP association open failed (%v); fast retry failed: %w", err, retryErr)
+	}
+	return retry, nil
 }
 
 func (c *Client) openUDPAssociationMode(ctx context.Context, resume []byte, fastRetry, rescue bool) (*udpAssociation, error) {
 	var lane *authenticatedLane
 	var err error
-	if rescue && c.cfg.Transport == TransportAuto {
+	if (fastRetry || rescue) && c.cfg.Transport == TransportAuto {
 		// An established association already failed. Waiting for another QUIC
-		// dial proves nothing about the endpoint and can exceed the preserved
-		// SOCKS datagram's useful lifetime, so recover this flow over the warm
-		// standby transport without changing global UDP health.
+		// dial -- or retrying a just-failed association on the same path -- can
+		// exceed the preserved SOCKS datagram's useful lifetime, so recover this
+		// flow over the warm standby transport without changing global UDP health.
 		c.metrics.Fallback()
 		lane, err = c.dialAuthenticatedCandidate(ctx, TransportTCP)
 	} else {
@@ -436,13 +462,11 @@ func (c *Client) openUDPAssociationMode(ctx context.Context, resume []byte, fast
 		Version: protocol.Version, Type: protocol.TypeOpen, SessionID: lane.sessionID,
 		FlowID: flowID, Class: protocol.ClassInteractive,
 	}, Payload: payload}); err != nil {
-		_ = lane.fc.Close()
-		return nil, fmt.Errorf("send UDP association open: %w", err)
+		return nil, failUDPAssociationOpenLane(lane, "send UDP association open", err)
 	}
 	response, err := lane.fc.Read()
 	if err != nil {
-		_ = lane.fc.Close()
-		return nil, fmt.Errorf("read UDP association acknowledgement: %w", err)
+		return nil, failUDPAssociationOpenLane(lane, "read UDP association acknowledgement", err)
 	}
 	if response.Header.SessionID != lane.sessionID || response.Header.FlowID != flowID {
 		_ = lane.fc.Close()
@@ -471,6 +495,17 @@ func (c *Client) openUDPAssociationMode(ctx context.Context, resume []byte, fast
 	}
 	_ = lane.outer.SetDeadline(time.Time{})
 	return association, nil
+}
+
+func failUDPAssociationOpenLane(lane *authenticatedLane, operation string, err error) error {
+	transportErr := &udpAssociationOpenTransportError{operation: operation, err: err}
+	if lane != nil && lane.fc != nil {
+		if observer, ok := lane.fc.transport().(interface{ transportFailed(error) }); ok {
+			observer.transportFailed(transportErr)
+		}
+		_ = lane.fc.Close()
+	}
+	return transportErr
 }
 
 func (c *Client) runClientUDPUplink(ctx context.Context, udpConn *net.UDPConn, fc *frameConn, sessionID [16]byte, flowID uint64, peerMu *sync.RWMutex, peer **net.UDPAddr, activity chan<- struct{}, counters *udpCounters) error {
@@ -776,51 +811,10 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	}
 	packets := make(chan udpDatagram, 32)
 	packetErr := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			_ = udpConn.SetReadDeadline(time.Now().Add(udpReadPoll))
-			var (
-				n           int
-				addr        *net.UDPAddr
-				destination string
-				readErr     error
-			)
-			if relay, ok := udpConn.(namedUDPRelay); ok {
-				n, destination, readErr = relay.ReadFromDestination(buf)
-			} else {
-				n, addr, readErr = udpConn.ReadFromUDP(buf)
-			}
-			if readErr != nil {
-				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
-					if assocCtx.Err() != nil {
-						packetErr <- assocCtx.Err()
-						return
-					}
-					continue
-				}
-				// As on the uplink: an unreachable peer describes one
-				// datagram, not this association.
-				if udperr.Transient(readErr) {
-					continue
-				}
-				packetErr <- readErr
-				return
-			}
-			if destination == "" {
-				var destinationErr error
-				destination, destinationErr = session.DestinationFromUDPAddr(addr)
-				if destinationErr != nil {
-					continue
-				}
-			}
-			select {
-			case packets <- udpDatagram{destination: destination, payload: append([]byte(nil), buf[:n]...)}:
-			case <-assocCtx.Done():
-				return
-			}
-		}
-	}()
+	stopPacketReader := startUDPRelayReader(assocCtx, udpConn, packets, packetErr)
+	// A retained socket must have exactly one reader. Stop and join the old
+	// worker before the earlier retention defer publishes it to a replacement.
+	defer stopPacketReader()
 
 	var counters udpCounters
 	var window packetWindow
@@ -1016,4 +1010,72 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 		return a == b
 	}
 	return a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
+}
+
+// startUDPRelayReader returns a synchronous stop operation. A cancelled reader
+// must not steal packets from the next owner of a retained relay socket.
+func startUDPRelayReader(ctx context.Context, udpConn serverUDPRelay, packets chan<- udpDatagram, packetErr chan<- error) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	var deadlineMu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 65535)
+		for {
+			deadlineMu.Lock()
+			if ctx.Err() != nil {
+				deadlineMu.Unlock()
+				return
+			}
+			_ = udpConn.SetReadDeadline(time.Now().Add(udpReadPoll))
+			deadlineMu.Unlock()
+			var (
+				n           int
+				addr        *net.UDPAddr
+				destination string
+				readErr     error
+			)
+			if relay, ok := udpConn.(namedUDPRelay); ok {
+				n, destination, readErr = relay.ReadFromDestination(buf)
+			} else {
+				n, addr, readErr = udpConn.ReadFromUDP(buf)
+			}
+			if readErr != nil {
+				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+					if ctx.Err() != nil {
+						packetErr <- ctx.Err()
+						return
+					}
+					continue
+				}
+				// As on the uplink: an unreachable peer describes one
+				// datagram, not this association.
+				if udperr.Transient(readErr) {
+					continue
+				}
+				packetErr <- readErr
+				return
+			}
+			if destination == "" {
+				var destinationErr error
+				destination, destinationErr = session.DestinationFromUDPAddr(addr)
+				if destinationErr != nil {
+					continue
+				}
+			}
+			select {
+			case packets <- udpDatagram{destination: destination, payload: append([]byte(nil), buf[:n]...)}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		deadlineMu.Lock()
+		_ = udpConn.SetReadDeadline(time.Now())
+		deadlineMu.Unlock()
+		<-done
+		_ = udpConn.SetReadDeadline(time.Time{})
+	}
 }
