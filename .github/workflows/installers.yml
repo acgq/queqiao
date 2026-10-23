@@ -1,0 +1,81 @@
+name: deb and Windows packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installers-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOENV: "off"
+      GOEXPERIMENT: ""
+      GOFIPS140: "off"
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+      GOWORK: "off"
+      GOAMD64: v1
+      GOARM64: v8.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Build provenance-bound archives
+        run: |
+          set -euo pipefail
+          version="v0.10.0-dev.${GITHUB_SHA:0:12}"
+          build_date=$(git show -s --format=%cI HEAD)
+          targets=linux/amd64,linux/arm64,windows/amd64,windows/arm64
+          output="$RUNNER_TEMP/queqiao-archives"
+          go run ./cmd/queqiaopack --version "$version" --commit "$GITHUB_SHA" \
+            --build-date "$build_date" --targets "$targets" --output "$output"
+          python3 scripts/validate_release.py --expected-targets "$targets" "$output"
+          (cd "$output" && sha256sum -c SHA256SUMS)
+          echo "ARCHIVES=$output" >> "$GITHUB_ENV"
+      - name: Build and inspect Debian packages
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/queqiao-deb"
+          for archive in "$ARCHIVES"/*_linux_*.tar.gz; do
+            python3 scripts/build_deb.py "$archive" --output "$RUNNER_TEMP/queqiao-deb"
+          done
+          for package in "$RUNNER_TEMP/queqiao-deb"/*.deb; do
+            dpkg-deb --info "$package"
+            dpkg-deb --contents "$package"
+            stage=$(mktemp -d "$RUNNER_TEMP/deb-inspect.XXXXXXXX")
+            dpkg-deb --extract "$package" "$stage"
+            test -x "$stage/usr/bin/queqiaod"
+            test -f "$stage/usr/share/doc/queqiao/THIRD_PARTY_LICENSES.txt"
+            if [ "$(dpkg-deb --field "$package" Architecture)" = amd64 ]; then
+              "$stage/usr/bin/queqiaod" version | grep -F "commit=$GITHUB_SHA"
+            fi
+          done
+          cp "$RUNNER_TEMP/queqiao-deb/"*.deb "$ARCHIVES/"
+      - name: Collect Windows executables
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            stage="$RUNNER_TEMP/windows-$arch"
+            mkdir -p "$stage"
+            unzip -q "$ARCHIVES/"*"_windows_$arch.zip" -d "$stage"
+            cp "$stage/"*/queqiaod.exe "$ARCHIVES/queqiaod_windows_$arch.exe"
+          done
+          (cd "$ARCHIVES" && sha256sum -- *.deb *.exe > INSTALLER-SHA256SUMS)
+          echo "Source commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Artifacts contain deb packages and unsigned Windows executables for amd64/arm64.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: queqiao-deb-windows-${{ github.sha }}
+          path: ${{ env.ARCHIVES }}/
+          if-no-files-found: error
+          retention-days: 30

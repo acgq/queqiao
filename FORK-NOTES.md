@@ -2,6 +2,30 @@
 
 This file describes local extensions without changing upstream documentation.
 
+## Development installation packages
+
+The **deb and Windows packages** Actions workflow can be run manually for an
+exact source commit. Its artifact includes amd64/arm64 Debian packages,
+unsigned Windows executables, portable archives, checksums, SBOMs and licenses.
+These are development builds, not signed public releases. Windows retains its
+testing status described in `docs/STATUS.md`.
+
+The Debian package installs `/usr/bin/queqiaod` and documentation under
+`/usr/share/doc/queqiao`. It does not create an identity, open a proxy listener,
+or enable a service. Configure the client or gateway using the bundled
+deployment instructions after installing with `sudo apt install ./queqiao_*.deb`.
+Use the package matching the machine's architecture. Verify the artifact's
+`INSTALLER-SHA256SUMS` before installation.
+
+`scripts/build_deb.py` wraps a Linux archive generated and validated by
+`cmd/queqiaopack`; it preserves its BUILDINFO, SBOM and dependency licenses.
+For example, on Linux with `dpkg-deb`:
+
+```sh
+python3 scripts/build_deb.py /path/to/queqiaod_VERSION_linux_amd64.tar.gz \
+  --output /path/to/new-deb-output
+```
+
 ## QUIC version selection
 
 Native clients prefer QUIC v2 and retain v1 for version negotiation. The
