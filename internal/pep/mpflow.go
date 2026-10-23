@@ -1887,7 +1887,11 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		switch {
 		case f.resumeRefused.Load():
 			terminal = errResumeRefused
-		case f.replacementAbandoned.Load():
+		// The QUIC manager also exits after a successful single-lane TCP
+		// handoff. That lane can still deliver pending bytes even though no
+		// replacement will be opened. Keep its original progress budget;
+		// abandonment is terminal only once no usable lane remains.
+		case f.replacementAbandoned.Load() && len(f.healthyLanes()) == 0:
 			terminal = errReplacementAbandoned
 		case now.Sub(sendSince) >= f.progressTimeout():
 			terminal = errFlowNoProgress
