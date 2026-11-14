@@ -182,7 +182,21 @@ type ClientConfig struct {
 	// serve the current flow over TCP, but it is neutral UDP evidence. With a
 	// pool, the QUIC attempt continues in the background so later flows can
 	// return to the preferred transport.
-	FallbackGrace       time.Duration
+	//
+	// It is a floor: on a high-RTT path a fixed window is too short for the
+	// QUIC handshake to finish, so the client silently rides TCP. When
+	// FallbackGraceRTTFactor is positive the effective window is scaled by the
+	// observed round-trip time, clamped to [FallbackGrace, FallbackGraceMax].
+	FallbackGrace time.Duration
+	// FallbackGraceRTTFactor multiplies the observed path RTT to derive the
+	// adaptive QUIC preference window. Zero disables adaptation (the fixed
+	// FallbackGrace is used). A handshake costs several round trips, so values
+	// well above 1 are appropriate; the default is tuned for lossy long-haul
+	// paths where a QUIC handshake can need a dozen or more RTTs.
+	FallbackGraceRTTFactor float64
+	// FallbackGraceMax caps the adaptive window so a pathological RTT cannot
+	// stall the first flow indefinitely. Zero means no cap.
+	FallbackGraceMax    time.Duration
 	UDPFailureThreshold int
 	UDPCooldown         time.Duration
 	// HopPortCount enables reactive UDP port hopping to evade per-port GFW
@@ -196,8 +210,12 @@ type ClientConfig struct {
 type Client struct {
 	// flowMeta asks a local capture agent what produced a flow. Nil when no
 	// agent is configured, which is the default.
-	flowMeta      *flowmeta.Lookup
-	cfg           ClientConfig
+	flowMeta *flowmeta.Lookup
+	cfg      ClientConfig
+	// observedRTT caches the most recent lane's measured round trip (nanoseconds) so
+	// the adaptive fallback grace can scale with the path. Updated on every
+	// authenticated lane; zero until the first dial.
+	observedRTT   atomic.Int64
 	udpHealth     *udpHealth
 	budget        *limiter.Budget
 	sessionLimit  *SessionLimit
@@ -214,7 +232,11 @@ type Client struct {
 	// dead shared connection causes one handshake rather than one handshake per
 	// affected flow. The dial has a client lifetime of its own and is not
 	// cancelled merely because the first flow waiting for it goes away.
-	quicMu         sync.Mutex
+	quicMu sync.Mutex
+	// serving is the context ServeListener runs under, so that work the
+	// client starts on its own -- a replacement for a pooled connection that
+	// went silent -- ends with it rather than outliving the listener.
+	serving        atomic.Pointer[context.Context]
 	quicGeneration *controlQUICGeneration
 	quicDial       *controlQUICDial
 	quicEpoch      uint64
@@ -373,6 +395,65 @@ type controlQUICGeneration struct {
 	packet     net.PacketConn
 	controller wancongestion.TelemetryProvider
 	closeOnce  sync.Once
+	// liveness watches for a connection that sends and hears nothing back,
+	// so new flows stop being opened on it long before QUIC's idle timeout.
+	liveness poolLiveness
+	// active counts the streams opened on this generation and not yet
+	// closed. A generation superseded for silence is not closed under the
+	// flows already on it -- the silence may be a false alarm, and those
+	// flows have their own recovery -- but it is closed once they are gone,
+	// or its keepalives would hold it open forever.
+	active     atomic.Int64
+	superseded atomic.Bool
+}
+
+// watchLiveness samples the connection's packet counters until it closes.
+//
+// Silence is acted on here, not when the next flow asks for the pool. The
+// flows opened in the first second after a path dies are the ones a page load
+// is waiting on, and waiting for the next one to notice would leave them on the
+// dead connection until QUIC's idle timeout. So: once silent, the generation
+// stops taking new flows and a replacement is dialed at once; once silent for
+// twice as long, it is closed, so the flows still on it fail in seconds and
+// are retried on the replacement rather than hanging for fifteen.
+func (g *controlQUICGeneration) watchLiveness(onSilent func(*controlQUICGeneration)) {
+	ticker := time.NewTicker(poolLivenessInterval)
+	defer ticker.Stop()
+	reported := false
+	for {
+		select {
+		case <-g.conn.Context().Done():
+			return
+		case now := <-ticker.C:
+			stats := g.conn.ConnectionStats()
+			g.liveness.observe(now, stats.PacketsSent, stats.PacketsReceived, stats.SmoothedRTT)
+			switch {
+			case g.liveness.dead(now):
+				g.close("queqiao pooled connection stopped answering")
+				return
+			case !reported && g.liveness.silent(now):
+				reported = true
+				if onSilent != nil {
+					onSilent(g)
+				}
+			}
+		}
+	}
+}
+
+// release is called when a stream opened on this generation closes.
+func (g *controlQUICGeneration) release() {
+	if g.active.Add(-1) <= 0 && g.superseded.Load() {
+		g.close("queqiao silent pooled connection drained")
+	}
+}
+
+// supersede takes the generation out of service for new flows.
+func (g *controlQUICGeneration) supersede() {
+	g.superseded.Store(true)
+	if g.active.Load() <= 0 {
+		g.close("queqiao silent pooled connection")
+	}
 }
 
 func (g *controlQUICGeneration) close(reason string) {
@@ -619,11 +700,44 @@ func (c *Client) UpdateCredentials(updated identity.ClientCredentials) error {
 	return nil
 }
 
-func (c *Client) fallbackGrace() time.Duration {
-	if c.cfg.FallbackGrace <= 0 {
-		return defaultFallbackGrace
+// observeLaneRTT records the round trip a newly dialed lane measured, which is
+// what the adaptive fallback grace scales.
+//
+// It used to record how long the dial took. A fresh QUIC dial is a handshake
+// and an authentication -- several round trips, more on a lossy path -- so the
+// grace was sixteen times that, and with the default factor it sat at its
+// thirty second ceiling after any cold dial: every request made while the
+// pool was down waited half a minute for QUIC before taking a TCP lane that
+// was already up. A pooled stream open, which takes no round trip at all,
+// then wrote nearly zero, so the grace swung between its floor and its ceiling
+// with whichever kind of dial happened last. A lane that measures no round
+// trip leaves the previous measurement standing.
+func (c *Client) observeLaneRTT(outer streamConn) {
+	if rtt := transportRTT(outer); rtt > 0 {
+		c.observedRTT.Store(int64(rtt))
 	}
-	return c.cfg.FallbackGrace
+}
+
+func (c *Client) fallbackGrace() time.Duration {
+	base := c.cfg.FallbackGrace
+	if base <= 0 {
+		base = defaultFallbackGrace
+	}
+	// Adaptive: scale the QUIC preference window with the observed path RTT so
+	// a high-RTT, multi-hop link gets a window long enough for its handshake,
+	// while a fast single-hop link keeps the snappy default. base is the floor.
+	if c.cfg.FallbackGraceRTTFactor > 0 {
+		if rtt := time.Duration(c.observedRTT.Load()); rtt > 0 {
+			adaptive := time.Duration(float64(rtt) * c.cfg.FallbackGraceRTTFactor)
+			if adaptive > base {
+				base = adaptive
+			}
+		}
+	}
+	if c.cfg.FallbackGraceMax > 0 && base > c.cfg.FallbackGraceMax {
+		base = c.cfg.FallbackGraceMax
+	}
+	return base
 }
 
 func (c *Client) windows() flowWindows {
@@ -679,12 +793,44 @@ func (c *Client) releasePendingOpen() {
 	}
 }
 
+// awaitPrewarm measures the path before the first flow is accepted, but waits
+// for the measurement no longer than prewarmReadyWait.
+//
+// The measurement is worth waiting for while it is quick, which on a healthy
+// path it is: a handshake and a hundred probe packets, about a second. On a path
+// that is slow to answer it is not: the prewarm is bounded only by its own
+// twenty second timeout, and while it ran the listener accepted nothing, so a
+// browser's connections sat in the kernel backlog for all of it. Past the wait
+// the prewarm carries on in the background and the flows that arrive share its
+// handshake -- the pooled dial is single-flight -- rather than waiting for it.
+func (c *Client) awaitPrewarm(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.prewarmPath(ctx)
+	}()
+	timer := time.NewTimer(prewarmReadyWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-timer.C:
+		c.cfg.Logger.Info("path prewarm still running; accepting flows", "waited", prewarmReadyWait)
+	}
+}
+
+// prewarmReadyWait is how long the listener holds its first flow for the path
+// measurement. It is a handful of round trips on the long paths this targets,
+// which is what a healthy prewarm takes.
+const prewarmReadyWait = 3 * time.Second
+
 // ServeListener is primarily useful for tests and service managers which
 // provide an already-bound socket. The listener is closed when the context is
 // cancelled or the method returns.
 func (c *Client) ServeListener(ctx context.Context, listener net.Listener) error {
 	defer listener.Close()
 	defer c.closeQUICPool()
+	c.serving.Store(&ctx)
 
 	// Readiness includes the first bounded path measurement. Starting it in a
 	// background watcher made the first accepted flow race the prewarm and
@@ -692,7 +838,7 @@ func (c *Client) ServeListener(ctx context.Context, listener net.Listener) error
 	// the route first so the watcher can still detect a change which happens
 	// during this measurement.
 	uplink := c.currentUplink()
-	c.prewarmPath(ctx)
+	c.awaitPrewarm(ctx)
 	// A route can change during a long lossy handshake. Reconcile once before
 	// publishing readiness; otherwise the listener accepts flows for up to one
 	// polling interval using the pool and path model the prewarm just measured
@@ -1085,7 +1231,7 @@ func (c *Client) racePipelinedFlow(ctx context.Context, payload []byte) (*opened
 			// changing endpoint health.
 			standbyC = nil
 			c.metrics.Fallback()
-			c.cfg.Logger.Debug("QUIC preference window elapsed; using TCP without penalizing UDP health",
+			c.cfg.Logger.Info("QUIC preference window elapsed; using TCP without penalizing UDP health",
 				"endpoint", c.cfg.RemoteAddr, "grace", c.fallbackGrace())
 			cancel()
 			closeLateFlow(quicResult)
@@ -1409,6 +1555,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 		return nil, transportError(kind, err)
 	}
 	outerReady := time.Now()
+	c.observeLaneRTT(outer)
 	_ = outer.SetDeadline(time.Now().Add(handshakeBound(outer, c.cfg.HandshakeTimeout)))
 	fc := newFrameConnLimited(outer, c.memoryLimits.frameReadBuffer, c.memoryLimits.eventQueue)
 	fc.setPacketsOnStream(c.cfg.UDPOnStream)
@@ -1446,6 +1593,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	// Track how many flows share the control connection. Bulk isolation is
 	// only worth its cost when there is something to protect.
 	c.quicPoolActive.Add(1)
+	generation.active.Add(1)
 	outer := &controlPoolStreamConn{
 		quicStreamConn: &quicStreamConn{stream: stream, conn: generation.conn, controller: generation.controller, closeConn: false, bulk: connBulkPath(generation.conn, c.memoryLimits.eventQueue)},
 		owner:          c, generation: generation,
@@ -1464,8 +1612,16 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		}
 		c.quicMu.Lock()
 		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil {
+			if !generation.liveness.silent(time.Now()) {
+				c.quicMu.Unlock()
+				return generation, nil
+			}
+			// Sending and hearing nothing for several round trips: open this
+			// flow, and every one after it, on a fresh connection instead of
+			// waiting out QUIC's idle timeout on one the path has abandoned.
 			c.quicMu.Unlock()
-			return generation, nil
+			c.supersedeSilentGeneration(generation, nil)
+			continue
 		}
 		stale := c.quicGeneration
 		c.quicGeneration = nil
@@ -1509,6 +1665,7 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 			id: attempt.epoch, conn: conn, packet: packet,
 			controller: configureQUICController(conn, ccfg),
 		}
+		go generation.watchLiveness(func(g *controlQUICGeneration) { c.supersedeSilentGeneration(g, &ccfg) })
 	}
 
 	c.quicMu.Lock()
@@ -1530,6 +1687,33 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 		attempt.superseded = true
 	}
 	close(attempt.done)
+}
+
+// supersedeSilentGeneration stops opening flows on a pooled connection that has
+// stopped answering. With a congestion configuration it also dials the
+// replacement immediately, so the next flow finds one ready rather than paying
+// a handshake on top of the outage.
+func (c *Client) supersedeSilentGeneration(generation *controlQUICGeneration, ccfg *congestionConfig) {
+	c.quicMu.Lock()
+	current := c.quicGeneration == generation
+	if current {
+		c.quicGeneration = nil
+	}
+	c.quicMu.Unlock()
+	if !current {
+		return
+	}
+	c.cfg.Logger.Warn("pooled QUIC connection stopped answering; dialing a fresh one",
+		"generation", generation.id)
+	generation.supersede()
+	serving := c.serving.Load()
+	if ccfg != nil && serving != nil && (*serving).Err() == nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(*serving, c.cfg.DialTimeout)
+			defer cancel()
+			_, _ = c.acquireControlQUICGeneration(ctx, *ccfg)
+		}()
+	}
 }
 
 func (c *Client) retireControlQUICGeneration(generation *controlQUICGeneration, reason string) {
@@ -1851,6 +2035,9 @@ func (s *controlPoolStreamConn) Close() error {
 	s.once.Do(func() {
 		if remaining := s.owner.quicPoolActive.Add(-1); remaining < 0 {
 			s.owner.quicPoolActive.Store(0)
+		}
+		if s.generation != nil {
+			s.generation.release()
 		}
 	})
 	return err
@@ -2821,7 +3008,7 @@ func (c *Client) raceUDPAndTCP(ctx context.Context) (*authenticatedLane, error) 
 		case <-standbyC:
 			standbyC = nil
 			c.metrics.Fallback()
-			c.cfg.Logger.Debug("QUIC preference window elapsed; using TCP without penalizing UDP health",
+			c.cfg.Logger.Info("QUIC preference window elapsed; using TCP without penalizing UDP health",
 				"endpoint", c.cfg.RemoteAddr, "grace", c.fallbackGrace())
 			if c.cfg.EnableQUICPool {
 				// The current request has its bounded answer, while the one
