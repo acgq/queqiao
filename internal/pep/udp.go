@@ -979,6 +979,10 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		}
 	}
 done:
+	// Cancellation reaches the association and the transport independently.
+	// A transport error can win before the association observes shutdown;
+	// consult the parent again before recording a failed flow.
+	failed = failed && ctx.Err() == nil
 	if endErr != nil && failed {
 		s.cfg.Logger.Debug("UDP association ended", "error", endErr)
 	}
