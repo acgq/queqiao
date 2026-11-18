@@ -962,6 +962,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	}
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
+	flowSession.watchReceiveGap = flow.kind == TransportQUIC
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)

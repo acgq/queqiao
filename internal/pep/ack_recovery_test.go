@@ -168,3 +168,28 @@ func TestFastACKPathRejectsInvalidPeerState(t *testing.T) {
 		})
 	}
 }
+
+func TestPersistentDownloadGap(t *testing.T) {
+	f := newStallTestFlow(t, nil)
+	f.watchReceiveGap = true
+	r := multipath.NewReassembler(multipath.DefaultConfig())
+	defer r.Close()
+	var last uint64
+	insert := func(seq uint64, payload string) {
+		t.Helper()
+		if _, _, err := r.Insert(multipath.Segment{Sequence: seq, Payload: []byte(payload)}); err != nil {
+			t.Fatal(err)
+		}
+		last = f.acknowledgeArrival(r, last)
+	}
+	insert(2, "cd")
+	start := f.receiveGapSince.Load()
+	insert(4, "ef")
+	if start == 0 || f.receiveGapSince.Load() != start {
+		t.Fatal("later data must not restart the timer for the same gap")
+	}
+	insert(0, "ab")
+	if last != 6 || f.receiveGapSince.Load() != 0 {
+		t.Fatal("filling the gap must clear its timer")
+	}
+}

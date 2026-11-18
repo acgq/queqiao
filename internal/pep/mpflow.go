@@ -404,7 +404,9 @@ type multipathFlow struct {
 	tcpStriping atomic.Bool
 	// gapPending marks that the peer should be told what is held above a gap,
 	// which is an acknowledgement whose cumulative point has not moved.
-	gapPending atomic.Bool
+	gapPending      atomic.Bool
+	watchReceiveGap bool // client can join a new QUIC lane for a stalled download
+	receiveGapSince atomic.Int64
 	// ACK state must be repeated after duplicate DATA or lane recovery even
 	// if the receive cursor did not move. A successful old-lane write does
 	// not prove the peer received it before that lane stopped working.
@@ -1770,7 +1772,7 @@ const (
 	// under the smallest threshold the clamp below can produce, so a stall is
 	// suspected within one threshold of becoming true rather than one scan.
 	stallScanInterval = 100 * time.Millisecond
-	// The threshold is three minimum round trips, clamped. The floor keeps a
+	// The threshold is three observed round trips, clamped. The floor keeps a
 	// fast LAN path from paying a rescue for an ordinary scheduling hiccup;
 	// the cap keeps a slow path from waiting so long that the rescue itself
 	// becomes the flow's whole remaining budget. Before any RTT sample
@@ -1878,8 +1880,10 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		stalledSend := scanStall(f.pendingOutbound(), f.lastAckProgressNS.Load(), now, threshold, &sendSince)
 		// Application bytes do not imply a response: TLS, HTTP/2 control
 		// messages, uploads and slow origins can legitimately be silent after
-		// delivery. Only unacknowledged transport work justifies lane rescue.
-		if !stalledSend {
+		// delivery. A buffered gap also proves the peer has sent undelivered data.
+		gapStart := f.receiveGapSince.Load()
+		stalledReceive := gapStart != 0 && now.Sub(time.Unix(0, gapStart)) >= threshold
+		if !stalledSend && !stalledReceive {
 			episode = false
 			continue
 		}
@@ -1895,7 +1899,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		// abandonment is terminal only once no usable lane remains.
 		case f.replacementAbandoned.Load() && len(f.healthyLanes()) == 0:
 			terminal = errReplacementAbandoned
-		case now.Sub(sendSince) >= f.progressTimeout():
+		case stalledSend && now.Sub(sendSince) >= f.progressTimeout():
 			terminal = errFlowNoProgress
 		}
 		if terminal != nil {
@@ -1930,7 +1934,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			if f.logger != nil {
 				f.logger.Info("flow stall suspected; lane demoted and rescue requested",
 					"flow_id", f.flowID, "threshold", threshold,
-					"send_stalled", stalledSend,
+					"send_stalled", stalledSend, "receive_gap_stalled", stalledReceive,
 					"healthy_spare", spare, "lanes", f.laneCount(),
 					"bytes_up", f.bytesUp.Load(), "bytes_down", f.bytesDown.Load())
 			}
@@ -2533,6 +2537,16 @@ const (
 // empty pipe and a full lane window, waiting for a gap it had never been told
 // about, until the reissue timer eventually filled it.
 func (f *multipathFlow) acknowledgeArrival(reassembler *multipath.Reassembler, lastAck uint64) uint64 {
+	if f.watchReceiveGap {
+		switch {
+		case reassembler.BufferedFrames() == 0:
+			f.receiveGapSince.Store(0)
+		case reassembler.NextSequence() > lastAck:
+			f.receiveGapSince.Store(time.Now().UnixNano())
+		case f.receiveGapSince.Load() == 0:
+			f.receiveGapSince.Store(time.Now().UnixNano())
+		}
+	}
 	if next := reassembler.NextSequence(); next > lastAck {
 		f.publishReceivedRanges(reassembler)
 		f.scheduleACK(next)
